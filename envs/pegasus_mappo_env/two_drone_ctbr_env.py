@@ -103,6 +103,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 log_filename=f"trajectory_{self._timestamp}_drone_{drone_id}",
                 enable_logging=self.config.start_logging,
             )
+            ctrl.configure_rl_sitl_params()
             agent = CTBRDroneRLAdapter(
                 drone_id=drone_id,
                 controller=ctrl,
