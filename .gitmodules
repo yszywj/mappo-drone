@@ -1,0 +1,3 @@
+[submodule "envs/mavlink_ctbr_controller"]
+	path = envs/mavlink_ctbr_controller
+	url = git@github.com:yszywj/mavlink_ctbr_controller.git
