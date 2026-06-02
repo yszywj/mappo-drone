@@ -10,3 +10,5 @@ log_folder/
 # 可选：忽略临时文件
 *.parquet
 .DS_Store
+# 结果文件
+results/
