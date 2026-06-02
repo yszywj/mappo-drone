@@ -19,7 +19,7 @@ class TwoDroneEnvConfig:
     episode_length: int = 300
 
     # Initial takeoff / reset.
-    takeoff_altitudes: Tuple[float, float] = (6.0, 8.0)
+    takeoff_altitudes: Tuple[float, float] = (5.0, 9.0)
     takeoff_timeout_sim_sec: float = 40.0
     stabilize_after_takeoff_sim_sec: float = 1.5
     recover_timeout_sim_sec: float = 12.0
@@ -36,19 +36,19 @@ class TwoDroneEnvConfig:
 
     # Success/collision thresholds.
     goal_tolerance_m: float = 0.6
-    collision_distance_m: float = 0.8
-    warning_distance_m: float = 1.8
+    collision_distance_m: float = 1.0
+    warning_distance_m: float = 2.5
 
     # Reward weights. Keep conservative first; tune after smoke tests.
     reward_progress_scale: float = 2.0
     reward_distance_scale: float = 0.05
-    reward_alive: float = 0.02
-    reward_control_scale: float = 0.01
+    reward_alive: float = 0.05
+    reward_control_scale: float = 0.05
     reward_close_penalty_scale: float = 0.25
     reward_success: float = 10.0
-    reward_collision: float = -20.0
-    reward_crash: float = -20.0
-    reward_timeout: float = -2.0
+    reward_collision: float = -30.0
+    reward_crash: float = -30.0
+    reward_timeout: float = 2.0
 
     action_limits: CTBRActionLimits = field(default_factory=CTBRActionLimits)
     safety_limits: SafetyLimits = field(default_factory=SafetyLimits)
