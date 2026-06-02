@@ -82,13 +82,12 @@ class PegasusSingleVecEnv:
             hard_unrecoverable_keywords = [
                 "near_ground",
                 "disarmed",
-                "failsafe",
-                "stale_observation",
+                "px4_failsafe_status",
             ]
 
-            # 这些可能只是保守阈值触发，允许先尝试 reset/recover。
             soft_recoverable_keywords = [
                 "timeout",
+                "stale_observation",
                 "too_high_alt",
                 "xy_out_of_bounds",
                 "z_out_of_bounds",

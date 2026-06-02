@@ -144,10 +144,16 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
             self._capture_homes()
 
         # Recover to stable home points before every RL episode.
-        recover_ok = self._recover_all_to_home()
-        if not recover_ok:
-            # Do not silently continue after a bad reset; MAPPO data would be invalid.
-            raise RuntimeError("reset failed: at least one drone could not recover to home")
+        need_recover = not self._all_near_home(self.config.recover_tolerance_m)
+
+        if need_recover:
+            recover_ok = self._recover_all_to_home()
+            if not recover_ok:
+                raise RuntimeError("reset failed: at least one drone could not recover to home")
+        else:
+            for agent in self.agents:
+                agent.set_safe_ctbr()
+                agent.start_ctbr(self.config.ctbr_send_hz)
 
         self._sample_or_set_goals()
         self._step_id = 0
@@ -180,11 +186,21 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
         infos = self._build_info(done_reason=done_reason)
 
         if np.any(dones):
+            normal_episode_end = done_reason in ["success", "timeout"]
+
             for agent in self.agents:
-                agent.stop_ctbr()
+                # 正常 episode 结束：不要停 CTBR，只把控制量置为安全悬停值
+                if normal_episode_end:
+                    agent.set_safe_ctbr()
+                else:
+                    # 真正异常才停，后续由 reset/recover 接管
+                    agent.stop_ctbr()
+
                 if hasattr(agent.controller, "mark_episode_done"):
-                    crashed = done_reason not in ["success", "timeout"]
-                    agent.controller.mark_episode_done(reason=done_reason, crashed=crashed)
+                    agent.controller.mark_episode_done(
+                        reason=done_reason,
+                        crashed=not normal_episode_end,
+                    )
 
         return obs, share_obs, rewards, dones, infos
 
@@ -222,20 +238,70 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
             agent.capture_home()
 
     def _recover_all_to_home(self) -> bool:
-        # Stop all CTBR first so old dangerous actions do not keep running.
+        homes = []
         for agent in self.agents:
-            agent.stop_ctbr()
-            agent.set_safe_ctbr()
+            if agent.state.home is None:
+                raise RuntimeError(f"drone {agent.drone_id}: home is not set")
+            homes.append(agent.state.home)
 
-        results = []
+        # 停 CTBR 前先设安全值，避免最后一条策略动作继续保持
         for agent in self.agents:
-            results.append(agent.recover_to_home(
-                time_keeper=self.time_keeper,
-                timeout_sim_sec=self.config.recover_timeout_sim_sec,
-                tolerance_m=self.config.recover_tolerance_m,
-            ))
-        self.time_keeper.wait(0.5, timeout=2.0)
-        return all(results)
+            agent.set_safe_ctbr()
+            agent.stop_ctbr()
+            if hasattr(agent.controller, "set_episode_phase"):
+                agent.controller.set_episode_phase("recover")
+
+        # 如果已经 OFFBOARD，不重复切模式；否则切一次
+        for agent, home in zip(self.agents, homes):
+            ctrl = agent.controller
+            if not (getattr(ctrl, "_armed", False) and ctrl._flight_mode_name() == "OFFBOARD"):
+                ok = ctrl.change_control_mode(
+                    mode=6,
+                    is_maintain_offboard=False,
+                    default_x=home.x,
+                    default_y=home.y,
+                    default_z=home.z,
+                    wait_for_data_timeout=0.5,
+                )
+                if not ok:
+                    return False
+
+        start_ms = self.time_keeper.now_ms()
+        timeout_ms = int(self.config.recover_timeout_sim_sec * 1000)
+
+        while self.time_keeper.now_ms() - start_ms < timeout_ms:
+            all_ok = True
+
+            # 关键：每一轮都给所有无人机发 setpoint
+            for agent, home in zip(self.agents, homes):
+                agent.controller.send_hover_setpoint(home.x, home.y, home.z)
+
+            for agent, home in zip(self.agents, homes):
+                safety = agent.check_single_drone_safety()
+
+                # 短暂 stale 不要立即失败；真正 disarmed/failsafe/near_ground 才失败
+                if safety.abnormal and not safety.recoverable:
+                    if safety.reason not in ["stale_observation"]:
+                        return False
+
+                obs = agent.get_observation()
+                err = math.sqrt(
+                    (float(obs.x) - home.x) ** 2
+                    + (float(obs.y) - home.y) ** 2
+                    + (float(obs.z) - home.z) ** 2
+                )
+                if err >= self.config.recover_tolerance_m:
+                    all_ok = False
+
+            if all_ok:
+                for agent in self.agents:
+                    agent.set_safe_ctbr()
+                    agent.start_ctbr(self.config.ctbr_send_hz)
+                return True
+
+            self.time_keeper.wait(0.05, timeout=1.0)
+
+        return False
 
     def _sample_or_set_goals(self) -> None:
         if self.config.fixed_goals is not None:
@@ -366,6 +432,23 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 "home": None if agent.state.home is None else (agent.state.home.x, agent.state.home.y, agent.state.home.z),
             })
         return infos
+
+    def _all_near_home(self, tolerance_m: float) -> bool:
+        for agent in self.agents:
+            if agent.state.home is None:
+                return False
+
+            obs = agent.get_observation()
+            home = agent.state.home
+            err = math.sqrt(
+                (float(obs.x) - home.x) ** 2
+                + (float(obs.y) - home.y) ** 2
+                + (float(obs.z) - home.z) ** 2
+            )
+            if err > tolerance_m:
+                return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Convenience methods for MAPPO integrations
