@@ -155,6 +155,8 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 agent.set_safe_ctbr()
                 agent.start_ctbr(self.config.ctbr_send_hz)
 
+        self._print_reset_ready_state()
+
         self._sample_or_set_goals()
         self._step_id = 0
         self._episode_id += 1
@@ -186,6 +188,25 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
         infos = self._build_info(done_reason=done_reason)
 
         if np.any(dones):
+
+            print(
+                f"[ENV DONE] episode={self._episode_id}, "
+                f"step={self._step_id}, reason={done_reason}"
+            )
+            for agent in self.agents:
+                obs = agent.get_observation()
+                home = agent.state.home
+                if home is not None:
+                    xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
+                    z_err = abs(float(obs.z) - home.z)
+                    print(
+                        f"  drone{agent.drone_id}: "
+                        f"pos=({obs.x:.2f},{obs.y:.2f},{obs.z:.2f}), "
+                        f"home=({home.x:.2f},{home.y:.2f},{home.z:.2f}), "
+                        f"xy_err={xy_err:.2f}, z_err={z_err:.2f}, "
+                        f"vz={obs.vz:.2f}"
+                    )
+
             normal_episode_end = done_reason in ["success", "timeout"]
 
             for agent in self.agents:
@@ -203,6 +224,34 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                     )
 
         return obs, share_obs, rewards, dones, infos
+
+    def _print_reset_ready_state(self) -> None:
+        print(f"[RESET READY] episode={self._episode_id + 1}")
+        for agent in self.agents:
+            obs = agent.get_observation()
+            home = agent.state.home
+            if home is None:
+                print(f"  drone{agent.drone_id}: home=None")
+                continue
+
+            xy_err = math.sqrt(
+                (float(obs.x) - home.x) ** 2
+                + (float(obs.y) - home.y) ** 2
+            )
+            z_err = abs(float(obs.z) - home.z)
+            dist = math.sqrt(
+                (float(obs.x) - home.x) ** 2
+                + (float(obs.y) - home.y) ** 2
+                + (float(obs.z) - home.z) ** 2
+            )
+
+            print(
+                f"  drone{agent.drone_id}: "
+                f"pos=({obs.x:.2f},{obs.y:.2f},{obs.z:.2f}), "
+                f"home=({home.x:.2f},{home.y:.2f},{home.z:.2f}), "
+                f"xy_err={xy_err:.2f}, z_err={z_err:.2f}, dist={dist:.2f}, "
+                f"vx={obs.vx:.2f}, vy={obs.vy:.2f}, vz={obs.vz:.2f}"
+            )
 
     # ------------------------------------------------------------------
     # Core mechanics
@@ -254,7 +303,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
         # 如果已经 OFFBOARD，不重复切模式；否则切一次
         for agent, home in zip(self.agents, homes):
             ctrl = agent.controller
-            if not (getattr(ctrl, "_armed", False) and ctrl._flight_mode_name() == "OFFBOARD"):
+            if not ctrl.is_probably_offboard():
                 ok = ctrl.change_control_mode(
                     mode=6,
                     is_maintain_offboard=False,
@@ -263,6 +312,8 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                     default_z=home.z,
                     wait_for_data_timeout=0.5,
                 )
+                if not ok:
+                    return False
                 if not ok:
                     return False
 
@@ -285,19 +336,63 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                         return False
 
                 obs = agent.get_observation()
-                err = math.sqrt(
+                
+                xy_err = math.sqrt(
                     (float(obs.x) - home.x) ** 2
                     + (float(obs.y) - home.y) ** 2
-                    + (float(obs.z) - home.z) ** 2
                 )
-                if err >= self.config.recover_tolerance_m:
+                z_err = abs(float(obs.z) - home.z)
+                speed_xy = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2)
+                speed_z = abs(float(obs.vz))
+
+                if (
+                    xy_err >= self.config.recover_tolerance_m
+                    or z_err >= 0.8
+                    or speed_xy >= 0.25
+                    or speed_z >= 0.25
+                ):
                     all_ok = False
 
             if all_ok:
-                for agent in self.agents:
-                    agent.set_safe_ctbr()
-                    agent.start_ctbr(self.config.ctbr_send_hz)
-                return True
+                hold_start_ms = self.time_keeper.now_ms()
+                hold_ms = 2000
+
+                while self.time_keeper.now_ms() - hold_start_ms < hold_ms:
+                    still_ok = True
+
+                    for agent, home in zip(self.agents, homes):
+                        agent.controller.send_hover_setpoint(home.x, home.y, home.z)
+
+                    self.time_keeper.wait(0.05, timeout=1.0)
+
+                    for agent, home in zip(self.agents, homes):
+                        obs = agent.get_observation()
+
+                        xy_err = math.sqrt(
+                            (float(obs.x) - home.x) ** 2
+                            + (float(obs.y) - home.y) ** 2
+                        )
+                        z_err = abs(float(obs.z) - home.z)
+                        speed_xy = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2)
+                        speed_z = abs(float(obs.vz))
+
+                        if (
+                            xy_err >= self.config.recover_tolerance_m
+                            or z_err >= 0.8
+                            or speed_xy >= 0.20
+                            or speed_z >= 0.20
+                        ):
+                            still_ok = False
+
+                    if not still_ok:
+                        all_ok = False
+                        break
+
+                if all_ok:
+                    for agent in self.agents:
+                        agent.set_safe_ctbr()
+                        agent.start_ctbr(self.config.ctbr_send_hz)
+                    return True
 
             self.time_keeper.wait(0.05, timeout=1.0)
 

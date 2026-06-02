@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument("--data_stream_hz", type=int, default=20)
     parser.add_argument("--takeoff_altitude_1", type=float, default=5.0)
     parser.add_argument("--takeoff_altitude_2", type=float, default=9.0)
-    parser.add_argument("--init_action_std", type=float, default=0.02)
+    parser.add_argument("--init_action_std", type=float, default=0.001)
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
 
@@ -109,14 +109,14 @@ def make_env(all_args):
     # Safe-hover 第一阶段：极保守动作范围。
     # 目标不是快速学会飞行，而是先保证不坠毁、不撞机、不触发 PX4 failsafe。
     action_limits = CTBRActionLimits(
-        max_roll_rate=0.03,
-        max_pitch_rate=0.03,
-        max_yaw_rate=0.02,
+        max_roll_rate=0.035,
+        max_pitch_rate=0.035,
+        max_yaw_rate=0.010,
 
-        hover_thrust=0.565,
-        thrust_delta=0.010,
-        thrust_min=0.55,
-        thrust_max=0.585,
+        hover_thrust=0.60,
+        thrust_delta=0.015,
+        thrust_min=0.50,
+        thrust_max=0.72,
     )
 
     # Safe-hover 第一阶段：收紧安全边界，避免飞远后 recover 很久。
@@ -127,10 +127,10 @@ def make_env(all_args):
         max_body_rate=4.0,
         max_down_speed=3.0,
 
-        max_xy_from_home=3.0,
-        max_z_error_from_home=2.0,
+        max_xy_from_home=5.5,
+        max_z_error_from_home=4.0,
 
-        stale_wall_time_sec=0.75,
+        stale_wall_time_sec=2.0,
     )
 
     env_cfg = TwoDroneEnvConfig(
@@ -210,8 +210,11 @@ def main():
     try:
         runner = PegasusHoverRunner(all_args, envs, device, run_dir)
         runner.run()
+    except KeyboardInterrupt:
+        print("\n[TRAIN] 收到 Ctrl+C，正在安全关闭环境...")
     finally:
         envs.close()
+        print("[TRAIN] 环境已关闭")
 
 
 if __name__ == "__main__":
