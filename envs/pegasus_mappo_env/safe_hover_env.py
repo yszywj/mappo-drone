@@ -92,18 +92,18 @@ class SafeHoverTwoDroneEnv(TwoDroneCTBREnv):
             if agent.state.goal is not None:
                 agent.state.last_goal_distance = goal_distance(obs, agent.state.goal)
 
-            rewards[i, 0] += 0.08                         # alive bonus
+            rewards[i, 0] += self.config.reward_alive      # alive bonus
             rewards[i, 0] -= 0.20 * xy_err                 # stay near home horizontally
             rewards[i, 0] -= 0.45 * z_err                  # stay near home altitude
             rewards[i, 0] -= 0.04 * speed                  # avoid drifting fast
             rewards[i, 0] -= 0.08 * tilt                   # avoid large attitude
-            rewards[i, 0] -= 0.02 * control_penalty        # avoid aggressive actions
+            rewards[i, 0] -= self.config.reward_control_scale * control_penalty
 
         # Timeout is the normal successful ending for this curriculum stage.
         if self._step_id >= self.config.episode_length and not done:
             done = True
             done_reason = "timeout"
-            rewards[:, 0] += 1.0
+            rewards[:, 0] += self.config.reward_timeout
 
         dones = np.array([done] * self.num_agents, dtype=bool)
         return rewards, dones, done_reason

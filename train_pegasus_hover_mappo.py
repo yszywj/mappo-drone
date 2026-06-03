@@ -109,8 +109,8 @@ def make_env(all_args):
     # Safe-hover 第一阶段：极保守动作范围。
     # 目标不是快速学会飞行，而是先保证不坠毁、不撞机、不触发 PX4 failsafe。
     action_limits = CTBRActionLimits(
-        max_roll_rate=0.035,
-        max_pitch_rate=0.035,
+        max_roll_rate=0.080,
+        max_pitch_rate=0.080,
         max_yaw_rate=0.010,
 
         hover_thrust=0.60,
@@ -142,8 +142,9 @@ def make_env(all_args):
         # 第一阶段建议两机高度差拉大，降低随机探索时的碰撞概率。
         takeoff_altitudes=(all_args.takeoff_altitude_1, all_args.takeoff_altitude_2),
 
+        stabilize_after_takeoff_sim_sec=5.0,
         recover_timeout_sim_sec=25.0,
-        recover_tolerance_m=1.0,
+        recover_tolerance_m=0.5,
 
         auto_takeoff_on_first_reset=True,
         start_logging=not all_args.no_pegasus_log,

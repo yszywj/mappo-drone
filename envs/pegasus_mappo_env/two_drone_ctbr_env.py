@@ -199,12 +199,16 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 if home is not None:
                     xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
                     z_err = abs(float(obs.z) - home.z)
+                    last_cmd = agent.state.prev_action
                     print(
                         f"  drone{agent.drone_id}: "
                         f"pos=({obs.x:.2f},{obs.y:.2f},{obs.z:.2f}), "
                         f"home=({home.x:.2f},{home.y:.2f},{home.z:.2f}), "
                         f"xy_err={xy_err:.2f}, z_err={z_err:.2f}, "
-                        f"vz={obs.vz:.2f}"
+                        f"vx={obs.vx:.2f}, vy={obs.vy:.2f}, vz={obs.vz:.2f}, "
+                        f"roll={obs.roll:.3f}, pitch={obs.pitch:.3f}, yaw={obs.yaw:.3f}, "
+                        f"cmd_rate=({last_cmd[0]:.3f},{last_cmd[1]:.3f},{last_cmd[2]:.3f}), "
+                        f"cmd_thrust={last_cmd[3]:.3f}"
                     )
 
             normal_episode_end = done_reason in ["success", "timeout"]
@@ -535,12 +539,23 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
 
             obs = agent.get_observation()
             home = agent.state.home
-            err = math.sqrt(
+            xy_err = math.sqrt(
                 (float(obs.x) - home.x) ** 2
                 + (float(obs.y) - home.y) ** 2
-                + (float(obs.z) - home.z) ** 2
             )
-            if err > tolerance_m:
+            z_err = abs(float(obs.z) - home.z)
+            speed_xy = math.sqrt(
+                float(obs.vx) ** 2
+                + float(obs.vy) ** 2
+            )
+            speed_z = abs(float(obs.vz))
+
+            if (
+                xy_err > tolerance_m
+                or z_err > 0.5
+                or speed_xy > 0.20
+                or speed_z > 0.20
+            ):
                 return False
 
         return True
