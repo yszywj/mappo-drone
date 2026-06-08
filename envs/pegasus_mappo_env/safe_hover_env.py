@@ -35,15 +35,37 @@ class SafeHoverTwoDroneEnv(TwoDroneCTBREnv):
     The reward is dominated by safety and home-position stability, not navigation.
     """
 
+    @staticmethod
+    def _goal_xy_error(obs, goal: GoalPoint) -> float:
+        return math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
+
     def _sample_or_set_goals(self) -> None:
-        # For hover training, the "goal" is the recovered home point.
-        # This keeps the existing observation layout unchanged:
-        # goal_rel = home - current_position.
+        if (
+            self.config.fixed_goals is not None
+            or self.config.goal_xy_radius_min > 0.0
+            or self.config.goal_xy_radius_max > 0.0
+            or self.config.goal_z_delta_max > 0.0
+        ):
+            super()._sample_or_set_goals()
+            self._reset_goal_xy_progress_baseline()
+            return
+
+        # Pure hover curriculum: the goal is the recovered home point.
+        # This keeps the existing observation layout unchanged.
         for agent in self.agents:
             home = agent.state.home
             if home is None:
                 raise RuntimeError("home must be set before safe-hover goal assignment")
             agent.set_goal(GoalPoint(home.x, home.y, home.z))
+        self._reset_goal_xy_progress_baseline()
+
+    def _reset_goal_xy_progress_baseline(self) -> None:
+        for agent in self.agents:
+            goal = agent.state.goal
+            if goal is None:
+                continue
+            obs = agent.get_observation()
+            agent.state.last_goal_distance = self._goal_xy_error(obs, goal)
 
     def _compute_rewards_and_dones(self, actions: Sequence[Sequence[float]], ok_time: bool):
         raw_obs = [agent.get_observation() for agent in self.agents]
@@ -80,20 +102,24 @@ class SafeHoverTwoDroneEnv(TwoDroneCTBREnv):
             home = agent.state.home
             if home is None:
                 raise RuntimeError("home is not set during safe-hover reward computation")
+            goal = agent.state.goal
+            if goal is None:
+                raise RuntimeError("goal is not set during safe-hover reward computation")
 
-            xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
+            xy_err = self._goal_xy_error(obs, goal)
             z_err = abs(float(obs.z) - home.z)
             speed = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2 + float(obs.vz) ** 2)
             tilt = math.sqrt(float(obs.roll) ** 2 + float(obs.pitch) ** 2)
             action_vec = np.asarray(actions[i], dtype=np.float32)
             control_penalty = float(np.mean(np.square(np.clip(action_vec, -1.0, 1.0))))
 
-            # Update last_goal_distance for logging/info consistency.
-            if agent.state.goal is not None:
-                agent.state.last_goal_distance = goal_distance(obs, agent.state.goal)
+            prev_goal_xy_err = agent.state.last_goal_distance if agent.state.last_goal_distance is not None else xy_err
+            progress = prev_goal_xy_err - xy_err
+            agent.state.last_goal_distance = xy_err
 
             rewards[i, 0] += self.config.reward_alive      # alive bonus
-            rewards[i, 0] -= 0.20 * xy_err                 # stay near home horizontally
+            rewards[i, 0] += 1.00 * progress               # move toward the sampled goal
+            rewards[i, 0] -= 0.35 * xy_err                 # stay near the sampled goal horizontally
             rewards[i, 0] -= 0.45 * z_err                  # stay near home altitude
             rewards[i, 0] -= 0.04 * speed                  # avoid drifting fast
             rewards[i, 0] -= 0.08 * tilt                   # avoid large attitude

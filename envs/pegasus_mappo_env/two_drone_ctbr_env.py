@@ -516,19 +516,33 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
         infos = []
         for i, agent in enumerate(self.agents):
             snap = agent.snapshot()
+            obs = raw_obs[i]
+            goal = goals[i]
+            home = agent.state.home
+            goal_xy_err = None
+            home_xy_err = None
+            z_err = None
+            if goal is not None:
+                goal_xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
+            if home is not None:
+                home_xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
+                z_err = abs(float(obs.z) - home.z)
             infos.append({
                 "episode_id": self._episode_id,
                 "step_id": self._step_id,
                 "drone_id": agent.drone_id,
                 "done_reason": done_reason,
                 "goal_distance": dists_to_goal[i],
+                "goal_xy_err": goal_xy_err,
+                "home_xy_err": home_xy_err,
+                "z_err": z_err,
                 "inter_drone_distance": d12,
                 "is_fresh": snap.is_fresh,
                 "armed": snap.armed,
                 "flight_mode": snap.flight_mode,
                 "last_status_text": snap.last_status_text,
                 "goal": None if goals[i] is None else (goals[i].x, goals[i].y, goals[i].z),
-                "home": None if agent.state.home is None else (agent.state.home.x, agent.state.home.y, agent.state.home.z),
+                "home": None if home is None else (home.x, home.y, home.z),
             })
         return infos
 

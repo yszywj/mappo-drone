@@ -250,10 +250,14 @@ class PegasusHoverRunner:
         return {
             "terminal_done_reasons": Counter(),
             "step_done_reasons": Counter(),
-            "home_dists": [],
+            "goal_dists": [],
+            "goal_xy_errs": [],
+            "z_errs": [],
             "inter_dists": [],
             "min_inter_drone_distance": float("inf"),
-            "max_home_dist": 0.0,
+            "max_goal_dist": 0.0,
+            "max_goal_xy_err": 0.0,
+            "max_z_err": 0.0,
             "episode_rewards": [],
             "terminal_count": 0,
         }
@@ -283,11 +287,23 @@ class PegasusHoverRunner:
                 stats["step_done_reasons"][reason] += 1
                 env_reasons.append(reason)
 
-                home_dist = agent_info.get("goal_distance", None)
-                if home_dist is not None:
-                    home_dist = float(home_dist)
-                    stats["home_dists"].append(home_dist)
-                    stats["max_home_dist"] = max(stats["max_home_dist"], home_dist)
+                goal_dist = agent_info.get("goal_distance", None)
+                if goal_dist is not None:
+                    goal_dist = float(goal_dist)
+                    stats["goal_dists"].append(goal_dist)
+                    stats["max_goal_dist"] = max(stats["max_goal_dist"], goal_dist)
+
+                goal_xy_err = agent_info.get("goal_xy_err", None)
+                if goal_xy_err is not None:
+                    goal_xy_err = float(goal_xy_err)
+                    stats["goal_xy_errs"].append(goal_xy_err)
+                    stats["max_goal_xy_err"] = max(stats["max_goal_xy_err"], goal_xy_err)
+
+                z_err = agent_info.get("z_err", None)
+                if z_err is not None:
+                    z_err = float(z_err)
+                    stats["z_errs"].append(z_err)
+                    stats["max_z_err"] = max(stats["max_z_err"], z_err)
 
                 d12 = agent_info.get("inter_drone_distance", None)
                 if d12 is not None:
@@ -313,8 +329,12 @@ class PegasusHoverRunner:
 
     def _print_rollout_stats(self, stats, episode, episodes, total_num_steps, train_infos, fps):
         mean_reward = float(np.mean(stats["episode_rewards"])) if stats["episode_rewards"] else 0.0
-        mean_home_dist = float(np.mean(stats["home_dists"])) if stats["home_dists"] else 0.0
-        max_home_dist = float(stats["max_home_dist"]) if stats["home_dists"] else 0.0
+        mean_goal_dist = float(np.mean(stats["goal_dists"])) if stats["goal_dists"] else 0.0
+        max_goal_dist = float(stats["max_goal_dist"]) if stats["goal_dists"] else 0.0
+        mean_goal_xy_err = float(np.mean(stats["goal_xy_errs"])) if stats["goal_xy_errs"] else 0.0
+        max_goal_xy_err = float(stats["max_goal_xy_err"]) if stats["goal_xy_errs"] else 0.0
+        mean_z_err = float(np.mean(stats["z_errs"])) if stats["z_errs"] else 0.0
+        max_z_err = float(stats["max_z_err"]) if stats["z_errs"] else 0.0
         mean_d12 = float(np.mean(stats["inter_dists"])) if stats["inter_dists"] else 0.0
         min_d12 = (
             float(stats["min_inter_drone_distance"])
@@ -328,8 +348,12 @@ class PegasusHoverRunner:
             f"steps {total_num_steps}/{self.num_env_steps}, FPS={fps}"
         )
         print(f"  mean_rollout_reward: {mean_reward:.4f}")
-        print(f"  mean_home_dist: {mean_home_dist:.3f}")
-        print(f"  max_home_dist: {max_home_dist:.3f}")
+        print(f"  mean_goal_dist: {mean_goal_dist:.3f}")
+        print(f"  max_goal_dist: {max_goal_dist:.3f}")
+        print(f"  mean_goal_xy_err: {mean_goal_xy_err:.3f}")
+        print(f"  max_goal_xy_err: {max_goal_xy_err:.3f}")
+        print(f"  mean_z_err: {mean_z_err:.3f}")
+        print(f"  max_z_err: {max_z_err:.3f}")
         print(f"  mean_inter_drone_distance: {mean_d12:.3f}")
         print(f"  min_inter_drone_distance: {min_d12:.3f}")
         print(f"  terminal_done_reasons: {dict(stats['terminal_done_reasons'])}")

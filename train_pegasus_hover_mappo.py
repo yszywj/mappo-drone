@@ -61,6 +61,10 @@ def parse_args():
     parser.add_argument("--takeoff_altitude_1", type=float, default=5.0)
     parser.add_argument("--takeoff_altitude_2", type=float, default=9.0)
     parser.add_argument("--init_action_std", type=float, default=0.001)
+    parser.add_argument("--residual_gain", type=float, default=0.0)
+    parser.add_argument("--goal_xy_radius_min", type=float, default=0.0)
+    parser.add_argument("--goal_xy_radius_max", type=float, default=0.0)
+    parser.add_argument("--goal_z_delta_max", type=float, default=0.0)
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
 
@@ -117,6 +121,7 @@ def make_env(all_args):
         thrust_delta=0.015,
         thrust_min=0.50,
         thrust_max=0.72,
+        residual_gain=all_args.residual_gain,
     )
 
     # Safe-hover 第一阶段：收紧安全边界，避免飞远后 recover 很久。
@@ -152,9 +157,9 @@ def make_env(all_args):
 
         # Hover curriculum:
         # SafeHoverTwoDroneEnv 会把目标覆盖成各自 home 点。
-        goal_xy_radius_min=0.0,
-        goal_xy_radius_max=0.0,
-        goal_z_delta_max=0.0,
+        goal_xy_radius_min=all_args.goal_xy_radius_min,
+        goal_xy_radius_max=all_args.goal_xy_radius_max,
+        goal_z_delta_max=all_args.goal_z_delta_max,
 
         # 第一阶段保守避碰。
         collision_distance_m=1.0,
@@ -206,6 +211,12 @@ def main():
     print(f"step_dt_sim_sec: {all_args.step_dt_sim_sec}")
     print(f"num_env_steps: {int(all_args.num_env_steps)}")
     print(f"init_action_std: {all_args.init_action_std}")
+    print(f"residual_gain: {all_args.residual_gain}")
+    print(
+        "goal sampling: "
+        f"xy_radius=[{all_args.goal_xy_radius_min}, {all_args.goal_xy_radius_max}], "
+        f"z_delta_max={all_args.goal_z_delta_max}"
+    )
     print("=" * 80)
 
     try:
