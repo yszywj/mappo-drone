@@ -60,11 +60,68 @@ def parse_args():
     parser.add_argument("--data_stream_hz", type=int, default=20)
     parser.add_argument("--takeoff_altitude_1", type=float, default=5.0)
     parser.add_argument("--takeoff_altitude_2", type=float, default=9.0)
+    parser.add_argument("--drone_1_world_x", type=float, default=0.0)
+    parser.add_argument("--drone_1_world_y", type=float, default=0.0)
+    parser.add_argument("--drone_2_world_x", type=float, default=0.0)
+    parser.add_argument("--drone_2_world_y", type=float, default=0.0)
     parser.add_argument("--init_action_std", type=float, default=0.001)
     parser.add_argument("--residual_gain", type=float, default=0.0)
+    parser.add_argument(
+        "--pd_feedback_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Backward-compatible alias for --goal_feedback_scale when that "
+            "argument is omitted. It now scales only final-goal XY attraction."
+        ),
+    )
+    parser.add_argument(
+        "--goal_feedback_scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale for final-goal XY position attraction. Set this to 0 to "
+            "disable goal pull while keeping attitude safety feedback active."
+        ),
+    )
+    parser.add_argument(
+        "--attitude_feedback_scale",
+        type=float,
+        default=1.0,
+        help="Scale for velocity damping and attitude-leveling safety feedback.",
+    )
+    parser.add_argument(
+        "--goal_scenario",
+        type=str,
+        default="random",
+        choices=["random", "cross_swap", "cross_midpoint"],
+        help=(
+            "random samples one goal around each home; cross_swap swaps the drones' "
+            "home XY targets; cross_midpoint sends both drones toward the midpoint "
+            "while keeping the final goals separated by cross_goal_distance_m."
+        ),
+    )
     parser.add_argument("--goal_xy_radius_min", type=float, default=0.0)
     parser.add_argument("--goal_xy_radius_max", type=float, default=0.0)
     parser.add_argument("--goal_z_delta_max", type=float, default=0.0)
+    parser.add_argument(
+        "--cross_goal_distance_m",
+        type=float,
+        default=2.0,
+        help="Fallback opposite-X target separation when cross_swap homes are too close in XY.",
+    )
+    parser.add_argument(
+        "--collision_distance_m",
+        type=float,
+        default=1.0,
+        help="Episode terminates as collision when 3D inter-drone distance is below this value.",
+    )
+    parser.add_argument(
+        "--warning_distance_m",
+        type=float,
+        default=2.5,
+        help="Dense proximity penalty starts when 3D inter-drone distance is below this value.",
+    )
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
 
@@ -95,6 +152,8 @@ def parse_args():
     all_args.critic_lr = min(all_args.critic_lr, 3e-4)
     all_args.entropy_coef = min(all_args.entropy_coef, 0.005)
     all_args.hidden_size = min(all_args.hidden_size, 64)
+    if all_args.goal_feedback_scale is None:
+        all_args.goal_feedback_scale = all_args.pd_feedback_scale
 
     return all_args
 
@@ -122,6 +181,9 @@ def make_env(all_args):
         thrust_min=0.50,
         thrust_max=0.72,
         residual_gain=all_args.residual_gain,
+        pd_feedback_scale=all_args.pd_feedback_scale,
+        goal_feedback_scale=all_args.goal_feedback_scale,
+        attitude_feedback_scale=all_args.attitude_feedback_scale,
     )
 
     # Safe-hover 第一阶段：收紧安全边界，避免飞远后 recover 很久。
@@ -155,15 +217,22 @@ def make_env(all_args):
         start_logging=not all_args.no_pegasus_log,
         log_dir=all_args.pegasus_log_dir,
 
-        # Hover curriculum:
-        # SafeHoverTwoDroneEnv 会把目标覆盖成各自 home 点。
+        # Goal curriculum. With zero radius and random scenario,
+        # SafeHoverTwoDroneEnv keeps the goal at each drone's home.
+        goal_scenario=all_args.goal_scenario,
+        world_xy_offsets=(
+            (all_args.drone_1_world_x, all_args.drone_1_world_y),
+            (all_args.drone_2_world_x, all_args.drone_2_world_y),
+        ),
         goal_xy_radius_min=all_args.goal_xy_radius_min,
         goal_xy_radius_max=all_args.goal_xy_radius_max,
         goal_z_delta_max=all_args.goal_z_delta_max,
+        cross_goal_distance_m=all_args.cross_goal_distance_m,
 
-        # 第一阶段保守避碰。
-        collision_distance_m=1.0,
-        warning_distance_m=2.5,
+        # Conservative collision curriculum. For real simulator training,
+        # use larger distances first to end risky episodes before physical contact.
+        collision_distance_m=all_args.collision_distance_m,
+        warning_distance_m=all_args.warning_distance_m,
 
         # Safe-hover 阶段：
         # timeout 表示安全活到 episode 结束，所以给正奖励。
@@ -212,10 +281,25 @@ def main():
     print(f"num_env_steps: {int(all_args.num_env_steps)}")
     print(f"init_action_std: {all_args.init_action_std}")
     print(f"residual_gain: {all_args.residual_gain}")
+    print(f"goal_feedback_scale: {all_args.goal_feedback_scale}")
+    print(f"attitude_feedback_scale: {all_args.attitude_feedback_scale}")
+    print(f"pd_feedback_scale legacy alias: {all_args.pd_feedback_scale}")
     print(
-        "goal sampling: "
+        "world XY offsets: "
+        f"drone1=({all_args.drone_1_world_x}, {all_args.drone_1_world_y}), "
+        f"drone2=({all_args.drone_2_world_x}, {all_args.drone_2_world_y})"
+    )
+    print(
+        "goal setup: "
+        f"scenario={all_args.goal_scenario}, "
         f"xy_radius=[{all_args.goal_xy_radius_min}, {all_args.goal_xy_radius_max}], "
-        f"z_delta_max={all_args.goal_z_delta_max}"
+        f"z_delta_max={all_args.goal_z_delta_max}, "
+        f"cross_goal_distance_m={all_args.cross_goal_distance_m}"
+    )
+    print(
+        "collision setup: "
+        f"collision_distance_m={all_args.collision_distance_m}, "
+        f"warning_distance_m={all_args.warning_distance_m}"
     )
     print("=" * 80)
 

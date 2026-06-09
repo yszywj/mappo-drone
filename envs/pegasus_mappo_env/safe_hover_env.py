@@ -22,7 +22,6 @@ import numpy as np
 from envs.mavlink_ctbr_controller.rl_bridge import (
     GoalPoint,
     goal_distance,
-    inter_drone_distance,
 )
 from envs.pegasus_mappo_env.two_drone_ctbr_env import TwoDroneCTBREnv
 
@@ -42,6 +41,7 @@ class SafeHoverTwoDroneEnv(TwoDroneCTBREnv):
     def _sample_or_set_goals(self) -> None:
         if (
             self.config.fixed_goals is not None
+            or self.config.goal_scenario in ("cross_swap", "cross_midpoint")
             or self.config.goal_xy_radius_min > 0.0
             or self.config.goal_xy_radius_max > 0.0
             or self.config.goal_z_delta_max > 0.0
@@ -87,7 +87,7 @@ class SafeHoverTwoDroneEnv(TwoDroneCTBREnv):
                 rewards[i, 0] += self.config.reward_crash
 
         # Collision/proximity safety.
-        d12 = inter_drone_distance(raw_obs[0], raw_obs[1])
+        d12 = self._inter_drone_distance(raw_obs)
         if d12 < self.config.collision_distance_m:
             done = True
             done_reason = f"collision_distance={d12:.2f}m"

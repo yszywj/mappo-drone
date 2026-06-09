@@ -43,9 +43,9 @@ from envs.mavlink_ctbr_controller.rl_bridge import (
     GoalPoint,
     HomePoint,
     goal_distance,
-    inter_drone_distance,
     observation_vector,
 )
+from envs.mavlink_ctbr_controller.ctbr_tools import ObservationData
 from .config import TwoDroneEnvConfig
 
 
@@ -158,6 +158,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
         self._print_reset_ready_state()
 
         self._sample_or_set_goals()
+        self._print_goal_ready_state()
         self._step_id = 0
         self._episode_id += 1
 
@@ -257,9 +258,57 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 f"vx={obs.vx:.2f}, vy={obs.vy:.2f}, vz={obs.vz:.2f}"
             )
 
+    def _print_goal_ready_state(self) -> None:
+        print(f"[GOAL READY] scenario={self.config.goal_scenario}")
+        for agent in self.agents:
+            agent_index = agent.drone_id - 1
+            home = agent.state.home
+            goal = agent.state.goal
+            if home is None or goal is None:
+                print(f"  drone{agent.drone_id}: home={home}, goal={goal}")
+                continue
+
+            goal_xy_from_home = math.sqrt((goal.x - home.x) ** 2 + (goal.y - home.y) ** 2)
+            goal_z_from_home = goal.z - home.z
+            home_world_x = home.x + self.config.world_xy_offsets[agent_index][0]
+            home_world_y = home.y + self.config.world_xy_offsets[agent_index][1]
+            goal_world_x, goal_world_y = self._world_goal_xy(goal, agent_index)
+            print(
+                f"  drone{agent.drone_id}: "
+                f"home=({home.x:.2f},{home.y:.2f},{home.z:.2f}), "
+                f"goal=({goal.x:.2f},{goal.y:.2f},{goal.z:.2f}), "
+                f"world_home=({home_world_x:.2f},{home_world_y:.2f},{home.z:.2f}), "
+                f"world_goal=({goal_world_x:.2f},{goal_world_y:.2f},{goal.z:.2f}), "
+                f"goal_xy_from_home={goal_xy_from_home:.2f}, "
+                f"goal_z_from_home={goal_z_from_home:.2f}"
+            )
+
     # ------------------------------------------------------------------
     # Core mechanics
     # ------------------------------------------------------------------
+
+    def _world_xy(self, obs, agent_index: int) -> Tuple[float, float]:
+        offset_x, offset_y = self.config.world_xy_offsets[agent_index]
+        return float(obs.x) + offset_x, float(obs.y) + offset_y
+
+    def _world_goal_xy(self, goal: GoalPoint, agent_index: int) -> Tuple[float, float]:
+        offset_x, offset_y = self.config.world_xy_offsets[agent_index]
+        return goal.x + offset_x, goal.y + offset_y
+
+    def _inter_drone_distance(self, raw_obs: Sequence[Any]) -> float:
+        x0, y0 = self._world_xy(raw_obs[0], 0)
+        x1, y1 = self._world_xy(raw_obs[1], 1)
+        dz = float(raw_obs[0].z) - float(raw_obs[1].z)
+        return math.sqrt((x0 - x1) ** 2 + (y0 - y1) ** 2 + dz ** 2)
+
+    def _other_obs_in_agent_local_frame(self, raw_obs: Sequence[Any], agent_index: int) -> ObservationData:
+        other_index = 1 - agent_index
+        other_obs = ObservationData(**raw_obs[other_index].__dict__)
+        own_offset_x, own_offset_y = self.config.world_xy_offsets[agent_index]
+        other_offset_x, other_offset_y = self.config.world_xy_offsets[other_index]
+        other_obs.x = float(other_obs.x) + other_offset_x - own_offset_x
+        other_obs.y = float(other_obs.y) + other_offset_y - own_offset_y
+        return other_obs
 
     def _takeoff_all_once(self) -> None:
         # Start with sequential takeoff for reliability.  You can parallelize later.
@@ -409,6 +458,77 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 agent.set_goal(GoalPoint(gx, gy, gz))
             return
 
+        scenario = self.config.goal_scenario
+        if scenario in ("cross_swap", "cross_midpoint"):
+            homes = [agent.state.home for agent in self.agents]
+            if any(home is None for home in homes):
+                raise RuntimeError(f"home must be set before assigning {scenario} goals")
+
+            assert homes[0] is not None and homes[1] is not None
+            home0_world_x = homes[0].x + self.config.world_xy_offsets[0][0]
+            home0_world_y = homes[0].y + self.config.world_xy_offsets[0][1]
+            home1_world_x = homes[1].x + self.config.world_xy_offsets[1][0]
+            home1_world_y = homes[1].y + self.config.world_xy_offsets[1][1]
+            dx = home1_world_x - home0_world_x
+            dy = home1_world_y - home0_world_y
+            home_xy_distance = math.sqrt(dx ** 2 + dy ** 2)
+
+            if scenario == "cross_swap" and home_xy_distance >= 0.5:
+                # Swap horizontal targets while preserving each drone's own home altitude.
+                self.agents[0].set_goal(GoalPoint(
+                    home1_world_x - self.config.world_xy_offsets[0][0],
+                    home1_world_y - self.config.world_xy_offsets[0][1],
+                    homes[0].z,
+                ))
+                self.agents[1].set_goal(GoalPoint(
+                    home0_world_x - self.config.world_xy_offsets[1][0],
+                    home0_world_y - self.config.world_xy_offsets[1][1],
+                    homes[1].z,
+                ))
+            else:
+                if home_xy_distance >= 0.5:
+                    unit_x = dx / home_xy_distance
+                    unit_y = dy / home_xy_distance
+                else:
+                    unit_x = 1.0
+                    unit_y = 0.0
+
+                center_x = 0.5 * (home0_world_x + home1_world_x)
+                center_y = 0.5 * (home0_world_y + home1_world_y)
+                half = 0.5 * self.config.cross_goal_distance_m
+
+                if home_xy_distance < 0.5:
+                    print(
+                        f"[GOAL SCENARIO] {scenario} requested, but home XY separation is "
+                        f"only {home_xy_distance:.2f}m. Using fallback opposite goals around the shared home."
+                    )
+
+                if scenario == "cross_midpoint":
+                    goal0_world_x = center_x - half * unit_x
+                    goal0_world_y = center_y - half * unit_y
+                    goal1_world_x = center_x + half * unit_x
+                    goal1_world_y = center_y + half * unit_y
+                else:
+                    goal0_world_x = center_x + half * unit_x
+                    goal0_world_y = center_y + half * unit_y
+                    goal1_world_x = center_x - half * unit_x
+                    goal1_world_y = center_y - half * unit_y
+
+                self.agents[0].set_goal(GoalPoint(
+                    goal0_world_x - self.config.world_xy_offsets[0][0],
+                    goal0_world_y - self.config.world_xy_offsets[0][1],
+                    homes[0].z,
+                ))
+                self.agents[1].set_goal(GoalPoint(
+                    goal1_world_x - self.config.world_xy_offsets[1][0],
+                    goal1_world_y - self.config.world_xy_offsets[1][1],
+                    homes[1].z,
+                ))
+            return
+
+        if scenario not in ("random", "hover"):
+            raise ValueError(f"unknown goal_scenario={scenario!r}")
+
         # Sample goals around each home point.  For the first stable version, keep z near home.
         for agent in self.agents:
             if agent.state.home is None:
@@ -434,7 +554,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 raise RuntimeError("goal is not set")
             obs_vec = observation_vector(
                 own=raw_obs[i],
-                other=raw_obs[other_i],
+                other=self._other_obs_in_agent_local_frame(raw_obs, i),
                 goal=goal,
                 prev_action=agent.state.prev_action,
             )
@@ -464,7 +584,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
                 rewards[i, 0] += self.config.reward_crash
 
         # Multi-drone collision / proximity.
-        d12 = inter_drone_distance(raw_obs[0], raw_obs[1])
+        d12 = self._inter_drone_distance(raw_obs)
         if d12 < self.config.collision_distance_m:
             done = True
             done_reason = f"collision_distance={d12:.2f}m"
@@ -512,7 +632,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
         raw_obs = [agent.get_observation() for agent in self.agents]
         goals = [agent.state.goal for agent in self.agents]
         dists_to_goal = [goal_distance(raw_obs[i], goals[i]) if goals[i] else None for i in range(self.num_agents)]
-        d12 = inter_drone_distance(raw_obs[0], raw_obs[1])
+        d12 = self._inter_drone_distance(raw_obs)
         infos = []
         for i, agent in enumerate(self.agents):
             snap = agent.snapshot()

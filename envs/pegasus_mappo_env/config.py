@@ -29,9 +29,12 @@ class TwoDroneEnvConfig:
     log_dir: str = "./log_folder"
 
     # Goal sampling around each drone's home point, in local NED coordinates.
+    goal_scenario: str = "random"
+    world_xy_offsets: Tuple[Tuple[float, float], Tuple[float, float]] = ((0.0, 0.0), (0.0, 0.0))
     goal_xy_radius_min: float = 1.5
     goal_xy_radius_max: float = 5.0
     goal_z_delta_max: float = 0.5
+    cross_goal_distance_m: float = 2.0
     fixed_goals: Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = None
 
     # Success/collision thresholds.
