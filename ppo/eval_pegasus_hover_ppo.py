@@ -3,8 +3,13 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from collections import Counter
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import torch
@@ -30,7 +35,22 @@ def parse_args():
     parser.add_argument("--cuda", action="store_true", default=False)
     parser.add_argument("--hidden_size", type=int, default=64)
     parser.add_argument("--init_action_std", type=float, default=0.05)
-    parser.add_argument("--residual_gain", type=float, default=0.05)
+    parser.add_argument("--residual_gain", type=float, default=0.8)
+    parser.add_argument("--goal_feedback_scale", type=float, default=0.0)
+    parser.add_argument("--attitude_feedback_scale", type=float, default=1.0)
+    parser.add_argument("--goal_xy_radius_min", type=float, default=0.0)
+    parser.add_argument("--goal_xy_radius_max", type=float, default=0.0)
+    parser.add_argument("--goal_z_delta_max", type=float, default=0.0)
+    parser.add_argument("--goal_tolerance_m", type=float, default=0.25)
+    parser.add_argument("--goal_z_tolerance_m", type=float, default=0.35)
+    parser.add_argument("--goal_speed_xy_tolerance_mps", type=float, default=0.25)
+    parser.add_argument("--goal_speed_z_tolerance_mps", type=float, default=0.25)
+    parser.add_argument("--reward_alive", type=float, default=0.0)
+    parser.add_argument("--reward_progress_scale", type=float, default=3.0)
+    parser.add_argument("--reward_distance_scale", type=float, default=0.10)
+    parser.add_argument("--reward_z_scale", type=float, default=0.20)
+    parser.add_argument("--reward_success", type=float, default=8.0)
+    parser.add_argument("--reward_timeout", type=float, default=0.0)
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
     return parser.parse_args()
@@ -53,6 +73,8 @@ def make_env(args) -> SingleDroneHoverEnv:
         thrust_min=0.50,
         thrust_max=0.72,
         residual_gain=args.residual_gain,
+        goal_feedback_scale=args.goal_feedback_scale,
+        attitude_feedback_scale=args.attitude_feedback_scale,
     )
     safety_limits = SafetyLimits(
         min_altitude=0.35,
@@ -77,10 +99,21 @@ def make_env(args) -> SingleDroneHoverEnv:
         recover_tolerance_m=0.5,
         start_logging=not args.no_pegasus_log,
         log_dir=args.pegasus_log_dir,
-        reward_alive=0.05,
+        reward_alive=args.reward_alive,
+        reward_progress_scale=args.reward_progress_scale,
+        reward_distance_scale=args.reward_distance_scale,
+        reward_z_scale=args.reward_z_scale,
         reward_control_scale=0.05,
+        reward_success=args.reward_success,
         reward_crash=-30.0,
-        reward_timeout=2.0,
+        reward_timeout=args.reward_timeout,
+        goal_xy_radius_min=args.goal_xy_radius_min,
+        goal_xy_radius_max=args.goal_xy_radius_max,
+        goal_z_delta_max=args.goal_z_delta_max,
+        goal_tolerance_m=args.goal_tolerance_m,
+        goal_z_tolerance_m=args.goal_z_tolerance_m,
+        goal_speed_xy_tolerance_mps=args.goal_speed_xy_tolerance_mps,
+        goal_speed_z_tolerance_mps=args.goal_speed_z_tolerance_mps,
         action_limits=action_limits,
         safety_limits=safety_limits,
     )
@@ -124,6 +157,22 @@ def main() -> None:
     print(f"episodes: {args.episodes}")
     print(f"episode_length: {args.episode_length}")
     print(f"residual_gain: {args.residual_gain}")
+    print(f"goal_feedback_scale: {args.goal_feedback_scale}")
+    print(f"attitude_feedback_scale: {args.attitude_feedback_scale}")
+    print(
+        f"goal_xy_radius: [{args.goal_xy_radius_min}, {args.goal_xy_radius_max}], "
+        f"goal_z_delta_max: {args.goal_z_delta_max}, "
+        f"goal_tolerance_m: {args.goal_tolerance_m}, "
+        f"goal_z_tolerance_m: {args.goal_z_tolerance_m}"
+    )
+    print(
+        f"success_speed_tolerance: xy={args.goal_speed_xy_tolerance_mps}, "
+        f"z={args.goal_speed_z_tolerance_mps}"
+    )
+    print(
+        f"reward: progress={args.reward_progress_scale}, distance={args.reward_distance_scale}, "
+        f"z={args.reward_z_scale}, success={args.reward_success}, timeout={args.reward_timeout}"
+    )
     print("=" * 80)
 
     episode_summaries = []

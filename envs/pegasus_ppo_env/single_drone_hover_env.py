@@ -22,6 +22,7 @@ from envs.mavlink_ctbr_controller.ctbr_controller import CTBRController
 from envs.mavlink_ctbr_controller.rl_bridge import (
     CTBRDroneRLAdapter,
     GoalPoint,
+    goal_distance,
     observation_vector,
 )
 from .config import SingleDroneEnvConfig
@@ -53,6 +54,8 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         self._airborne = False
         self._episode_id = 0
         self._step_id = 0
+        self._last_goal_xy_err: Optional[float] = None
+        self._last_goal_xy_progress = 0.0
         self._timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         self.controller: Optional[CTBRController] = None
@@ -134,7 +137,7 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         self._episode_id += 1
         home = self.agent.state.home
         assert home is not None
-        self.agent.set_goal(GoalPoint(home.x, home.y, home.z))
+        self._sample_or_set_goal()
         self.agent.set_safe_ctbr()
         if hasattr(self.controller, "set_episode"):
             self.controller.set_episode(self._episode_id, phase="collect", step_id=0)
@@ -163,7 +166,7 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
 
         if done:
             self._print_done_state(done_reason)
-            normal_episode_end = done_reason == "timeout"
+            normal_episode_end = done_reason in ("success", "timeout")
             if normal_episode_end:
                 self.agent.set_safe_ctbr()
             else:
@@ -256,6 +259,28 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
 
         return False
 
+    def _sample_or_set_goal(self) -> None:
+        assert self.agent is not None
+        if self.agent.state.home is None:
+            raise RuntimeError("home must be set before sampling goal")
+
+        home = self.agent.state.home
+        min_r = max(0.0, self.config.goal_xy_radius_min)
+        max_r = max(min_r, self.config.goal_xy_radius_max)
+        r = self._rng.uniform(min_r, max_r)
+        theta = self._rng.uniform(-math.pi, math.pi)
+        z_delta_max = max(0.0, self.config.goal_z_delta_max)
+        dz = self._rng.uniform(-z_delta_max, z_delta_max)
+        goal = GoalPoint(
+            x=home.x + r * math.cos(theta),
+            y=home.y + r * math.sin(theta),
+            z=home.z + dz,
+        )
+        self.agent.set_goal(goal)
+        obs = self.agent.get_observation()
+        self._last_goal_xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
+        self._last_goal_xy_progress = 0.0
+
     def _build_obs(self) -> np.ndarray:
         assert self.agent is not None
         obs = self.agent.get_observation()
@@ -292,18 +317,38 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
             done_reason = safety.reason
             reward += self.config.reward_crash
 
-        xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
-        z_err = abs(float(obs.z) - home.z)
+        goal = self.agent.state.goal or GoalPoint(home.x, home.y, home.z)
+        xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
+        z_err = abs(float(obs.z) - goal.z)
+        prev_xy_err = self._last_goal_xy_err if self._last_goal_xy_err is not None else xy_err
+        goal_xy_progress = prev_xy_err - xy_err
+        self._last_goal_xy_err = xy_err
+        self._last_goal_xy_progress = goal_xy_progress
         speed = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2 + float(obs.vz) ** 2)
         tilt = math.sqrt(float(obs.roll) ** 2 + float(obs.pitch) ** 2)
         control_penalty = float(np.mean(np.square(np.clip(action, -1.0, 1.0))))
 
         reward += self.config.reward_alive
-        reward -= 0.20 * xy_err
-        reward -= 0.45 * z_err
+        reward += self.config.reward_progress_scale * goal_xy_progress
+        reward -= self.config.reward_distance_scale * xy_err
+        reward -= self.config.reward_z_scale * z_err
         reward -= 0.04 * speed
         reward -= 0.08 * tilt
         reward -= self.config.reward_control_scale * control_penalty
+
+        speed_xy = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2)
+        speed_z = abs(float(obs.vz))
+        goal_reached = (
+            xy_err <= self.config.goal_tolerance_m
+            and z_err <= self.config.goal_z_tolerance_m
+            and speed_xy <= self.config.goal_speed_xy_tolerance_mps
+            and speed_z <= self.config.goal_speed_z_tolerance_mps
+        )
+
+        if not done and goal_reached:
+            done = True
+            done_reason = "success"
+            reward += self.config.reward_success
 
         if self._step_id >= self.config.episode_length and not done:
             done = True
@@ -316,18 +361,31 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         assert self.agent is not None
         obs = self.agent.get_observation()
         home = self.agent.state.home
+        goal = self.agent.state.goal
         xy_err = None
         z_err = None
+        goal_dist = None
+        home_xy_err = None
+        speed_xy = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2)
+        speed_z = abs(float(obs.vz))
+        if goal is not None:
+            xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
+            z_err = abs(float(obs.z) - goal.z)
+            goal_dist = goal_distance(obs, goal)
         if home is not None:
-            xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
-            z_err = abs(float(obs.z) - home.z)
+            home_xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
         return {
             "episode_id": self._episode_id,
             "step_id": self._step_id,
             "done_reason": done_reason,
             "xy_err": xy_err,
             "z_err": z_err,
-            "speed_xy": math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2),
+            "goal_distance": goal_dist,
+            "goal_xy_progress": self._last_goal_xy_progress,
+            "home_xy_err": home_xy_err,
+            "speed_xy": speed_xy,
+            "speed_z": speed_z,
+            "goal": None if goal is None else (goal.x, goal.y, goal.z),
             "home": None if home is None else (home.x, home.y, home.z),
         }
 
@@ -352,7 +410,7 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         info = self._build_info("reset")
         print(
             f"[PPO RESET READY] episode={self._episode_id}, "
-            f"xy_err={info['xy_err']:.2f}, z_err={info['z_err']:.2f}, "
+            f"goal_xy_err={info['xy_err']:.2f}, z_err={info['z_err']:.2f}, "
             f"speed_xy={info['speed_xy']:.2f}"
         )
 
@@ -360,15 +418,16 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         assert self.agent is not None
         obs = self.agent.get_observation()
         home = self.agent.state.home
-        if home is None:
+        goal = self.agent.state.goal
+        if home is None or goal is None:
             print(f"[PPO ENV DONE] episode={self._episode_id}, step={self._step_id}, reason={reason}")
             return
-        xy_err = math.sqrt((float(obs.x) - home.x) ** 2 + (float(obs.y) - home.y) ** 2)
-        z_err = abs(float(obs.z) - home.z)
+        xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
+        z_err = abs(float(obs.z) - goal.z)
         cmd = self.agent.state.prev_action
         print(
             f"[PPO ENV DONE] episode={self._episode_id}, step={self._step_id}, reason={reason}, "
-            f"xy_err={xy_err:.2f}, z_err={z_err:.2f}, "
+            f"goal_xy_err={xy_err:.2f}, z_err={z_err:.2f}, "
             f"vx={obs.vx:.2f}, vy={obs.vy:.2f}, vz={obs.vz:.2f}, "
             f"roll={obs.roll:.3f}, pitch={obs.pitch:.3f}, yaw={obs.yaw:.3f}, "
             f"cmd_rate=({cmd[0]:.3f},{cmd[1]:.3f},{cmd[2]:.3f}), cmd_thrust={cmd[3]:.3f}"

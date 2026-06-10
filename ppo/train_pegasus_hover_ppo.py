@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import random
+import sys
 import time
 from collections import Counter
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import torch
@@ -15,6 +22,38 @@ from envs.mavlink_ctbr_controller.rl_bridge import CTBRActionLimits, SafetyLimit
 from envs.pegasus_ppo_env.config import SingleDroneEnvConfig
 from envs.pegasus_ppo_env.single_drone_hover_env import SingleDroneHoverEnv
 from ppo.actor_critic import ActorCritic
+
+
+UPDATE_METRIC_FIELDS = [
+    "update",
+    "total_steps",
+    "mean_rollout_reward",
+    "mean_xy_err",
+    "max_xy_err",
+    "success_count",
+    "timeout_count",
+    "other_done_count",
+    "done_reasons",
+    "policy_loss",
+    "value_loss",
+    "entropy",
+]
+
+EPISODE_METRIC_FIELDS = [
+    "episode",
+    "total_steps",
+    "episode_steps",
+    "return",
+    "done_reason",
+    "final_goal_xy_err",
+    "final_z_err",
+    "final_goal_distance",
+    "final_speed_xy",
+    "final_speed_z",
+    "mean_goal_xy_err",
+    "max_goal_xy_err",
+    "success",
+]
 
 
 def parse_args():
@@ -41,10 +80,238 @@ def parse_args():
     parser.add_argument("--entropy_coef", type=float, default=0.001)
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
     parser.add_argument("--init_action_std", type=float, default=0.05)
-    parser.add_argument("--residual_gain", type=float, default=0.02)
+    parser.add_argument("--residual_gain", type=float, default=0.8)
+    parser.add_argument("--goal_feedback_scale", type=float, default=0.0)
+    parser.add_argument("--attitude_feedback_scale", type=float, default=1.0)
+    parser.add_argument("--goal_xy_radius_min", type=float, default=0.0)
+    parser.add_argument("--goal_xy_radius_max", type=float, default=0.0)
+    parser.add_argument("--goal_z_delta_max", type=float, default=0.0)
+    parser.add_argument("--goal_tolerance_m", type=float, default=0.25)
+    parser.add_argument("--goal_z_tolerance_m", type=float, default=0.35)
+    parser.add_argument("--goal_speed_xy_tolerance_mps", type=float, default=0.25)
+    parser.add_argument("--goal_speed_z_tolerance_mps", type=float, default=0.25)
+    parser.add_argument("--reward_alive", type=float, default=0.0)
+    parser.add_argument("--reward_progress_scale", type=float, default=3.0)
+    parser.add_argument("--reward_distance_scale", type=float, default=0.10)
+    parser.add_argument("--reward_z_scale", type=float, default=0.20)
+    parser.add_argument("--reward_success", type=float, default=8.0)
+    parser.add_argument("--reward_timeout", type=float, default=0.0)
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
     return parser.parse_args()
+
+
+def append_csv_row(path: Path, fieldnames, row) -> None:
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def save_svg_line_chart(path: Path, title: str, x_values, series) -> None:
+    if not x_values or not series:
+        return
+
+    width = 1000
+    height = 520
+    left = 80
+    right = 30
+    top = 56
+    bottom = 70
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    colors = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#f97316"]
+
+    x_min = min(x_values)
+    x_max = max(x_values)
+    if x_min == x_max:
+        x_min -= 1.0
+        x_max += 1.0
+
+    all_y = []
+    for _, values in series:
+        all_y.extend(values)
+    y_min = min(all_y)
+    y_max = max(all_y)
+    if y_min == y_max:
+        pad = max(1.0, abs(y_min) * 0.1)
+        y_min -= pad
+        y_max += pad
+    else:
+        pad = 0.08 * (y_max - y_min)
+        y_min -= pad
+        y_max += pad
+
+    def sx(x):
+        return left + (float(x) - x_min) / (x_max - x_min) * plot_w
+
+    def sy(y):
+        return top + (y_max - float(y)) / (y_max - y_min) * plot_h
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{left}" y="32" font-family="sans-serif" font-size="22" font-weight="700" fill="#111827">{title}</text>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_h}" stroke="#374151" stroke-width="1"/>',
+        f'<line x1="{left}" y1="{top + plot_h}" x2="{left + plot_w}" y2="{top + plot_h}" stroke="#374151" stroke-width="1"/>',
+    ]
+
+    for i in range(6):
+        frac = i / 5
+        y = top + frac * plot_h
+        value = y_max - frac * (y_max - y_min)
+        parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}" stroke="#e5e7eb" stroke-width="1"/>')
+        parts.append(f'<text x="{left - 10}" y="{y + 4:.1f}" font-family="sans-serif" font-size="12" text-anchor="end" fill="#4b5563">{value:.3g}</text>')
+
+    for idx, (label, values) in enumerate(series):
+        color = colors[idx % len(colors)]
+        points = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(x_values, values))
+        parts.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+        legend_x = left + idx * 190
+        legend_y = height - 25
+        parts.append(f'<line x1="{legend_x}" y1="{legend_y}" x2="{legend_x + 28}" y2="{legend_y}" stroke="{color}" stroke-width="3"/>')
+        parts.append(f'<text x="{legend_x + 36}" y="{legend_y + 4}" font-family="sans-serif" font-size="13" fill="#111827">{label}</text>')
+
+    parts.append(f'<text x="{left + plot_w / 2:.1f}" y="{height - 8}" font-family="sans-serif" font-size="13" text-anchor="middle" fill="#4b5563">step/update/episode</text>')
+    parts.append("</svg>")
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def save_svg_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
+    plots_dir = run_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    if update_rows:
+        updates = [row["update"] for row in update_rows]
+        save_svg_line_chart(
+            plots_dir / "training_reward.svg",
+            "PPO Mean Rollout Reward",
+            updates,
+            [("mean_rollout_reward", [row["mean_rollout_reward"] for row in update_rows])],
+        )
+        save_svg_line_chart(
+            plots_dir / "training_goal_xy_err.svg",
+            "PPO Goal XY Error",
+            updates,
+            [
+                ("mean_xy_err", [row["mean_xy_err"] for row in update_rows]),
+                ("max_xy_err", [row["max_xy_err"] for row in update_rows]),
+            ],
+        )
+        save_svg_line_chart(
+            plots_dir / "losses.svg",
+            "PPO Losses And Entropy",
+            updates,
+            [
+                ("policy_loss", [row["policy_loss"] for row in update_rows]),
+                ("value_loss", [row["value_loss"] for row in update_rows]),
+                ("entropy", [row["entropy"] for row in update_rows]),
+            ],
+        )
+
+    if episode_rows:
+        episodes = [row["episode"] for row in episode_rows]
+        success_flags = np.asarray([1.0 if row["success"] else 0.0 for row in episode_rows], dtype=np.float32)
+        cumulative_success = np.cumsum(success_flags) / np.arange(1, len(success_flags) + 1)
+        save_svg_line_chart(
+            plots_dir / "episode_final_goal_xy_err.svg",
+            "Episode Final Goal XY Error",
+            episodes,
+            [("final_goal_xy_err", [row["final_goal_xy_err"] for row in episode_rows])],
+        )
+        save_svg_line_chart(
+            plots_dir / "episode_success_rate.svg",
+            "Episode Cumulative Success Rate",
+            episodes,
+            [("success_rate", cumulative_success.tolist())],
+        )
+
+    print(f"[PPO TRAIN] saved SVG plots to {plots_dir}")
+
+
+def save_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
+    if not update_rows and not episode_rows:
+        return
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[PPO TRAIN] matplotlib unavailable ({exc}); saving SVG plots instead")
+        save_svg_training_plots(run_dir, update_rows, episode_rows)
+        return
+
+    plots_dir = run_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    if update_rows:
+        updates = [row["update"] for row in update_rows]
+        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+        axes[0].plot(updates, [row["mean_rollout_reward"] for row in update_rows], label="mean rollout reward")
+        axes[0].set_ylabel("reward")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(updates, [row["mean_xy_err"] for row in update_rows], label="mean goal xy err")
+        axes[1].plot(updates, [row["max_xy_err"] for row in update_rows], label="max goal xy err", alpha=0.75)
+        axes[1].set_ylabel("meters")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+        axes[2].bar(updates, [row["success_count"] for row in update_rows], label="success")
+        axes[2].bar(updates, [row["timeout_count"] for row in update_rows], bottom=[row["success_count"] for row in update_rows], label="timeout")
+        axes[2].set_ylabel("terminal episodes")
+        axes[2].set_xlabel("update")
+        axes[2].grid(True, axis="y", alpha=0.3)
+        axes[2].legend()
+        fig.tight_layout()
+        overview_path = plots_dir / "training_overview.png"
+        fig.savefig(overview_path, dpi=150)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+        axes[0].plot(updates, [row["policy_loss"] for row in update_rows], label="policy loss")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+        axes[1].plot(updates, [row["value_loss"] for row in update_rows], label="value loss", color="tab:orange")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+        axes[2].plot(updates, [row["entropy"] for row in update_rows], label="entropy", color="tab:green")
+        axes[2].set_xlabel("update")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+        fig.tight_layout()
+        losses_path = plots_dir / "losses.png"
+        fig.savefig(losses_path, dpi=150)
+        plt.close(fig)
+
+    if episode_rows:
+        episodes = [row["episode"] for row in episode_rows]
+        final_xy = [row["final_goal_xy_err"] for row in episode_rows]
+        colors = ["tab:green" if row["success"] else "tab:red" for row in episode_rows]
+        success_flags = np.asarray([1.0 if row["success"] else 0.0 for row in episode_rows], dtype=np.float32)
+        cumulative_success = np.cumsum(success_flags) / np.arange(1, len(success_flags) + 1)
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.scatter(episodes, final_xy, c=colors, label="final goal xy err")
+        ax.plot(episodes, final_xy, color="tab:blue", alpha=0.25)
+        ax.set_xlabel("episode")
+        ax.set_ylabel("final goal xy err (m)")
+        ax.grid(True, alpha=0.3)
+        ax2 = ax.twinx()
+        ax2.plot(episodes, cumulative_success, color="tab:green", label="cumulative success rate")
+        ax2.set_ylabel("success rate")
+        ax2.set_ylim(0.0, 1.05)
+        fig.tight_layout()
+        episodes_path = plots_dir / "episode_outcomes.png"
+        fig.savefig(episodes_path, dpi=150)
+        plt.close(fig)
+
+    print(f"[PPO TRAIN] saved plots to {plots_dir}")
 
 
 def set_seed(seed: int):
@@ -64,6 +331,8 @@ def make_env(args):
         thrust_min=0.50,
         thrust_max=0.72,
         residual_gain=args.residual_gain,
+        goal_feedback_scale=args.goal_feedback_scale,
+        attitude_feedback_scale=args.attitude_feedback_scale,
     )
     safety_limits = SafetyLimits(
         min_altitude=0.35,
@@ -88,10 +357,21 @@ def make_env(args):
         recover_tolerance_m=0.5,
         start_logging=not args.no_pegasus_log,
         log_dir=args.pegasus_log_dir,
-        reward_alive=0.05,
+        reward_alive=args.reward_alive,
+        reward_progress_scale=args.reward_progress_scale,
+        reward_distance_scale=args.reward_distance_scale,
+        reward_z_scale=args.reward_z_scale,
         reward_control_scale=0.05,
+        reward_success=args.reward_success,
         reward_crash=-30.0,
-        reward_timeout=2.0,
+        reward_timeout=args.reward_timeout,
+        goal_xy_radius_min=args.goal_xy_radius_min,
+        goal_xy_radius_max=args.goal_xy_radius_max,
+        goal_z_delta_max=args.goal_z_delta_max,
+        goal_tolerance_m=args.goal_tolerance_m,
+        goal_z_tolerance_m=args.goal_z_tolerance_m,
+        goal_speed_xy_tolerance_mps=args.goal_speed_xy_tolerance_mps,
+        goal_speed_z_tolerance_mps=args.goal_speed_z_tolerance_mps,
         action_limits=action_limits,
         safety_limits=safety_limits,
     )
@@ -121,7 +401,12 @@ def main():
 
     run_dir = Path("./results") / "PegasusSingleDroneHover" / "ppo" / f"seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
     model_dir = run_dir / "models"
+    metrics_dir = run_dir / "metrics"
     model_dir.mkdir(parents=True, exist_ok=True)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
+    update_metrics_path = metrics_dir / "update_metrics.csv"
+    episode_metrics_path = metrics_dir / "episode_metrics.csv"
 
     env = make_env(args)
     policy = ActorCritic(env.obs_dim, env.action_dim, hidden_size=args.hidden_size, init_std=args.init_action_std).to(device)
@@ -135,12 +420,34 @@ def main():
     print(f"rollout_steps: {args.rollout_steps}")
     print(f"episode_length: {args.episode_length}")
     print(f"residual_gain: {args.residual_gain}")
+    print(f"goal_feedback_scale: {args.goal_feedback_scale}")
+    print(f"attitude_feedback_scale: {args.attitude_feedback_scale}")
+    print(
+        f"goal_xy_radius: [{args.goal_xy_radius_min}, {args.goal_xy_radius_max}], "
+        f"goal_z_delta_max: {args.goal_z_delta_max}, "
+        f"goal_tolerance_m: {args.goal_tolerance_m}, "
+        f"goal_z_tolerance_m: {args.goal_z_tolerance_m}"
+    )
+    print(
+        f"success_speed_tolerance: xy={args.goal_speed_xy_tolerance_mps}, "
+        f"z={args.goal_speed_z_tolerance_mps}"
+    )
+    print(
+        f"reward: progress={args.reward_progress_scale}, distance={args.reward_distance_scale}, "
+        f"z={args.reward_z_scale}, success={args.reward_success}, timeout={args.reward_timeout}"
+    )
     print(f"init_action_std: {args.init_action_std}")
     print("=" * 80)
 
     obs, _ = env.reset()
     total_steps = 0
     update = 0
+    update_rows = []
+    episode_rows = []
+    episode_rewards = []
+    episode_xy_errs = []
+    episode_z_errs = []
+    episode_goal_distances = []
     try:
         while total_steps < args.num_env_steps:
             obs_buf = []
@@ -168,13 +475,41 @@ def main():
                 done_buf.append(bool(done))
                 value_buf.append(float(value_t.item()))
                 stats_rewards.append(float(reward))
+                episode_rewards.append(float(reward))
                 stats_reasons[info.get("done_reason", "running")] += 1
                 if info.get("xy_err") is not None:
-                    stats_xy.append(float(info["xy_err"]))
+                    xy_err = float(info["xy_err"])
+                    stats_xy.append(xy_err)
+                    episode_xy_errs.append(xy_err)
+                if info.get("z_err") is not None:
+                    episode_z_errs.append(float(info["z_err"]))
+                if info.get("goal_distance") is not None:
+                    episode_goal_distances.append(float(info["goal_distance"]))
 
                 obs = next_obs
                 total_steps += 1
                 if done:
+                    episode_row = {
+                        "episode": int(info.get("episode_id", 0)),
+                        "total_steps": int(total_steps),
+                        "episode_steps": int(info.get("step_id", len(episode_rewards))),
+                        "return": float(np.sum(episode_rewards)) if episode_rewards else 0.0,
+                        "done_reason": str(info.get("done_reason", "unknown")),
+                        "final_goal_xy_err": float(info["xy_err"]) if info.get("xy_err") is not None else 0.0,
+                        "final_z_err": float(info["z_err"]) if info.get("z_err") is not None else 0.0,
+                        "final_goal_distance": float(info["goal_distance"]) if info.get("goal_distance") is not None else 0.0,
+                        "final_speed_xy": float(info["speed_xy"]) if info.get("speed_xy") is not None else 0.0,
+                        "final_speed_z": float(info["speed_z"]) if info.get("speed_z") is not None else 0.0,
+                        "mean_goal_xy_err": float(np.mean(episode_xy_errs)) if episode_xy_errs else 0.0,
+                        "max_goal_xy_err": float(np.max(episode_xy_errs)) if episode_xy_errs else 0.0,
+                        "success": str(info.get("done_reason", "unknown")) == "success",
+                    }
+                    episode_rows.append(episode_row)
+                    append_csv_row(episode_metrics_path, EPISODE_METRIC_FIELDS, episode_row)
+                    episode_rewards = []
+                    episode_xy_errs = []
+                    episode_z_errs = []
+                    episode_goal_distances = []
                     obs, _ = env.reset()
                 if total_steps >= args.num_env_steps:
                     break
@@ -228,20 +563,49 @@ def main():
             mean_reward = float(np.mean(stats_rewards)) if stats_rewards else 0.0
             mean_xy = float(np.mean(stats_xy)) if stats_xy else 0.0
             max_xy = float(np.max(stats_xy)) if stats_xy else 0.0
+            policy_loss_mean = float(np.mean(pg_losses)) if pg_losses else 0.0
+            value_loss_mean = float(np.mean(value_losses)) if value_losses else 0.0
+            entropy_mean = float(np.mean(entropies)) if entropies else 0.0
+            success_count = int(stats_reasons.get("success", 0))
+            timeout_count = int(stats_reasons.get("timeout", 0))
+            other_done_count = int(sum(
+                count
+                for reason, count in stats_reasons.items()
+                if reason not in ("running", "success", "timeout")
+            ))
+            update_row = {
+                "update": int(update),
+                "total_steps": int(total_steps),
+                "mean_rollout_reward": mean_reward,
+                "mean_xy_err": mean_xy,
+                "max_xy_err": max_xy,
+                "success_count": success_count,
+                "timeout_count": timeout_count,
+                "other_done_count": other_done_count,
+                "done_reasons": json.dumps(dict(stats_reasons), sort_keys=True),
+                "policy_loss": policy_loss_mean,
+                "value_loss": value_loss_mean,
+                "entropy": entropy_mean,
+            }
+            update_rows.append(update_row)
+            append_csv_row(update_metrics_path, UPDATE_METRIC_FIELDS, update_row)
             print("=" * 80)
             print(f"[PegasusPPO] update={update}, steps={total_steps}/{args.num_env_steps}")
             print(f"  mean_rollout_reward: {mean_reward:.4f}")
             print(f"  mean_xy_err: {mean_xy:.3f}")
             print(f"  max_xy_err: {max_xy:.3f}")
             print(f"  done_reasons: {dict(stats_reasons)}")
-            print(f"  policy_loss: {np.mean(pg_losses):.6f}")
-            print(f"  value_loss: {np.mean(value_losses):.6f}")
-            print(f"  entropy: {np.mean(entropies):.6f}")
+            print(f"  policy_loss: {policy_loss_mean:.6f}")
+            print(f"  value_loss: {value_loss_mean:.6f}")
+            print(f"  entropy: {entropy_mean:.6f}")
     except KeyboardInterrupt:
         print("\n[PPO TRAIN] interrupted, closing environment...")
     finally:
         env.close()
         print("[PPO TRAIN] environment closed")
+        print(f"[PPO TRAIN] saved update metrics to {update_metrics_path}")
+        print(f"[PPO TRAIN] saved episode metrics to {episode_metrics_path}")
+        save_training_plots(run_dir, update_rows, episode_rows)
 
 
 if __name__ == "__main__":
