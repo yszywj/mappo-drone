@@ -51,6 +51,36 @@ from envs.pegasus_mappo_env.mappo_vec_env import PegasusSingleVecEnv
 from onpolicy.runner.shared.pegasus_hover_runner import PegasusHoverRunner
 
 
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+def start_terminal_log(run_dir: Path):
+    log_dir = run_dir / "terminal_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "console.log"
+    log_file = log_path.open("a", buffering=1, encoding="utf-8")
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeStream(original_stdout, log_file)
+    sys.stderr = TeeStream(original_stderr, log_file)
+    print(f"[TRAIN] terminal output is being saved to {log_path}")
+    return log_file, original_stdout, original_stderr
+
+
 def parse_args():
     parser = get_config()
 
@@ -66,6 +96,13 @@ def parse_args():
     parser.add_argument("--drone_2_world_y", type=float, default=0.0)
     parser.add_argument("--init_action_std", type=float, default=0.001)
     parser.add_argument("--residual_gain", type=float, default=0.0)
+    parser.add_argument("--hover_thrust", type=float, default=0.60)
+    parser.add_argument("--thrust_delta", type=float, default=0.015)
+    parser.add_argument("--thrust_min", type=float, default=0.50)
+    parser.add_argument("--thrust_max", type=float, default=0.72)
+    parser.add_argument("--z_pos_gain", type=float, default=0.08)
+    parser.add_argument("--z_vel_gain", type=float, default=0.025)
+    parser.add_argument("--recover_z_tolerance_m", type=float, default=0.25)
     parser.add_argument(
         "--pd_feedback_scale",
         type=float,
@@ -124,6 +161,7 @@ def parse_args():
     )
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
+    parser.add_argument("--no_terminal_log", action="store_true", default=False)
 
     all_args = parser.parse_args()
 
@@ -176,14 +214,16 @@ def make_env(all_args):
         max_pitch_rate=0.080,
         max_yaw_rate=0.010,
 
-        hover_thrust=0.60,
-        thrust_delta=0.015,
-        thrust_min=0.50,
-        thrust_max=0.72,
+        hover_thrust=all_args.hover_thrust,
+        thrust_delta=all_args.thrust_delta,
+        thrust_min=all_args.thrust_min,
+        thrust_max=all_args.thrust_max,
         residual_gain=all_args.residual_gain,
         pd_feedback_scale=all_args.pd_feedback_scale,
         goal_feedback_scale=all_args.goal_feedback_scale,
         attitude_feedback_scale=all_args.attitude_feedback_scale,
+        z_pos_gain=all_args.z_pos_gain,
+        z_vel_gain=all_args.z_vel_gain,
     )
 
     # Safe-hover 第一阶段：收紧安全边界，避免飞远后 recover 很久。
@@ -212,6 +252,7 @@ def make_env(all_args):
         stabilize_after_takeoff_sim_sec=5.0,
         recover_timeout_sim_sec=25.0,
         recover_tolerance_m=0.5,
+        recover_z_tolerance_m=all_args.recover_z_tolerance_m,
 
         auto_takeoff_on_first_reset=True,
         start_logging=not all_args.no_pegasus_log,
@@ -269,6 +310,9 @@ def main():
         / f"seed{all_args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
+    terminal_log = None
+    if not all_args.no_terminal_log:
+        terminal_log = start_terminal_log(run_dir)
 
     envs = make_env(all_args)
 
@@ -283,6 +327,13 @@ def main():
     print(f"residual_gain: {all_args.residual_gain}")
     print(f"goal_feedback_scale: {all_args.goal_feedback_scale}")
     print(f"attitude_feedback_scale: {all_args.attitude_feedback_scale}")
+    print(
+        f"thrust: hover={all_args.hover_thrust}, delta={all_args.thrust_delta}, "
+        f"range=[{all_args.thrust_min}, {all_args.thrust_max}]"
+    )
+    print(f"z_pos_gain: {all_args.z_pos_gain}")
+    print(f"z_vel_gain: {all_args.z_vel_gain}")
+    print(f"recover_z_tolerance_m: {all_args.recover_z_tolerance_m}")
     print(f"pd_feedback_scale legacy alias: {all_args.pd_feedback_scale}")
     print(
         "world XY offsets: "
@@ -311,6 +362,12 @@ def main():
     finally:
         envs.close()
         print("[TRAIN] 环境已关闭")
+        if terminal_log is not None:
+            log_file, original_stdout, original_stderr = terminal_log
+            print(f"[TRAIN] saved terminal output to {log_file.name}")
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_file.close()
 
 
 if __name__ == "__main__":

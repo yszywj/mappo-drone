@@ -38,6 +38,13 @@ def parse_args():
     parser.add_argument("--residual_gain", type=float, default=0.8)
     parser.add_argument("--goal_feedback_scale", type=float, default=0.0)
     parser.add_argument("--attitude_feedback_scale", type=float, default=1.0)
+    parser.add_argument("--hover_thrust", type=float, default=0.60)
+    parser.add_argument("--thrust_delta", type=float, default=0.015)
+    parser.add_argument("--thrust_min", type=float, default=0.50)
+    parser.add_argument("--thrust_max", type=float, default=0.72)
+    parser.add_argument("--z_pos_gain", type=float, default=0.08)
+    parser.add_argument("--z_vel_gain", type=float, default=0.025)
+    parser.add_argument("--recover_z_tolerance_m", type=float, default=0.25)
     parser.add_argument("--goal_xy_radius_min", type=float, default=0.0)
     parser.add_argument("--goal_xy_radius_max", type=float, default=0.0)
     parser.add_argument("--goal_z_delta_max", type=float, default=0.0)
@@ -68,13 +75,15 @@ def make_env(args) -> SingleDroneHoverEnv:
         max_roll_rate=0.080,
         max_pitch_rate=0.080,
         max_yaw_rate=0.010,
-        hover_thrust=0.60,
-        thrust_delta=0.015,
-        thrust_min=0.50,
-        thrust_max=0.72,
+        hover_thrust=args.hover_thrust,
+        thrust_delta=args.thrust_delta,
+        thrust_min=args.thrust_min,
+        thrust_max=args.thrust_max,
         residual_gain=args.residual_gain,
         goal_feedback_scale=args.goal_feedback_scale,
         attitude_feedback_scale=args.attitude_feedback_scale,
+        z_pos_gain=args.z_pos_gain,
+        z_vel_gain=args.z_vel_gain,
     )
     safety_limits = SafetyLimits(
         min_altitude=0.35,
@@ -97,6 +106,7 @@ def make_env(args) -> SingleDroneHoverEnv:
         stabilize_after_takeoff_sim_sec=5.0,
         recover_timeout_sim_sec=25.0,
         recover_tolerance_m=0.5,
+        recover_z_tolerance_m=args.recover_z_tolerance_m,
         start_logging=not args.no_pegasus_log,
         log_dir=args.pegasus_log_dir,
         reward_alive=args.reward_alive,
@@ -159,6 +169,13 @@ def main() -> None:
     print(f"residual_gain: {args.residual_gain}")
     print(f"goal_feedback_scale: {args.goal_feedback_scale}")
     print(f"attitude_feedback_scale: {args.attitude_feedback_scale}")
+    print(
+        f"thrust: hover={args.hover_thrust}, delta={args.thrust_delta}, "
+        f"range=[{args.thrust_min}, {args.thrust_max}]"
+    )
+    print(f"z_pos_gain: {args.z_pos_gain}")
+    print(f"z_vel_gain: {args.z_vel_gain}")
+    print(f"recover_z_tolerance_m: {args.recover_z_tolerance_m}")
     print(
         f"goal_xy_radius: [{args.goal_xy_radius_min}, {args.goal_xy_radius_max}], "
         f"goal_z_delta_max: {args.goal_z_delta_max}, "

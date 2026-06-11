@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
+import os
 import random
 import sys
 import time
@@ -30,6 +32,14 @@ UPDATE_METRIC_FIELDS = [
     "mean_rollout_reward",
     "mean_xy_err",
     "max_xy_err",
+    "mean_z_err",
+    "max_z_err",
+    "mean_signed_z_err",
+    "mean_goal_xy_progress",
+    "mean_speed_xy",
+    "max_speed_xy",
+    "mean_speed_z",
+    "max_speed_z",
     "success_count",
     "timeout_count",
     "other_done_count",
@@ -48,10 +58,20 @@ EPISODE_METRIC_FIELDS = [
     "final_goal_xy_err",
     "final_z_err",
     "final_goal_distance",
+    "final_goal_rel_x",
+    "final_goal_rel_y",
+    "final_goal_rel_z",
+    "final_signed_z_err",
     "final_speed_xy",
     "final_speed_z",
+    "final_cmd_roll_rate",
+    "final_cmd_pitch_rate",
+    "final_cmd_yaw_rate",
+    "final_cmd_thrust",
     "mean_goal_xy_err",
     "max_goal_xy_err",
+    "mean_z_err",
+    "max_z_err",
     "success",
 ]
 
@@ -83,6 +103,13 @@ def parse_args():
     parser.add_argument("--residual_gain", type=float, default=0.8)
     parser.add_argument("--goal_feedback_scale", type=float, default=0.0)
     parser.add_argument("--attitude_feedback_scale", type=float, default=1.0)
+    parser.add_argument("--hover_thrust", type=float, default=0.60)
+    parser.add_argument("--thrust_delta", type=float, default=0.015)
+    parser.add_argument("--thrust_min", type=float, default=0.50)
+    parser.add_argument("--thrust_max", type=float, default=0.72)
+    parser.add_argument("--z_pos_gain", type=float, default=0.08)
+    parser.add_argument("--z_vel_gain", type=float, default=0.025)
+    parser.add_argument("--recover_z_tolerance_m", type=float, default=0.25)
     parser.add_argument("--goal_xy_radius_min", type=float, default=0.0)
     parser.add_argument("--goal_xy_radius_max", type=float, default=0.0)
     parser.add_argument("--goal_z_delta_max", type=float, default=0.0)
@@ -98,6 +125,7 @@ def parse_args():
     parser.add_argument("--reward_timeout", type=float, default=0.0)
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
+    parser.add_argument("--no_terminal_log", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -108,6 +136,36 @@ def append_csv_row(path: Path, fieldnames, row) -> None:
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+class TeeStream:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
+
+
+def start_terminal_log(run_dir: Path):
+    log_dir = run_dir / "terminal_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "console.log"
+    log_file = log_path.open("a", buffering=1, encoding="utf-8")
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeStream(original_stdout, log_file)
+    sys.stderr = TeeStream(original_stderr, log_file)
+    print(f"[PPO TRAIN] terminal output is being saved to {log_path}")
+    return log_file, original_stdout, original_stderr
 
 
 def save_svg_line_chart(path: Path, title: str, x_values, series) -> None:
@@ -201,6 +259,23 @@ def save_svg_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
             ],
         )
         save_svg_line_chart(
+            plots_dir / "training_z_and_speed.svg",
+            "PPO Z Error And Speed",
+            updates,
+            [
+                ("mean_z_err", [row["mean_z_err"] for row in update_rows]),
+                ("max_z_err", [row["max_z_err"] for row in update_rows]),
+                ("mean_speed_xy", [row["mean_speed_xy"] for row in update_rows]),
+                ("mean_speed_z", [row["mean_speed_z"] for row in update_rows]),
+            ],
+        )
+        save_svg_line_chart(
+            plots_dir / "training_progress.svg",
+            "PPO Goal XY Progress",
+            updates,
+            [("mean_goal_xy_progress", [row["mean_goal_xy_progress"] for row in update_rows])],
+        )
+        save_svg_line_chart(
             plots_dir / "losses.svg",
             "PPO Losses And Entropy",
             updates,
@@ -227,6 +302,24 @@ def save_svg_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
             episodes,
             [("success_rate", cumulative_success.tolist())],
         )
+        save_svg_line_chart(
+            plots_dir / "episode_final_z_err.svg",
+            "Episode Final Z Error",
+            episodes,
+            [
+                ("final_z_err", [row["final_z_err"] for row in episode_rows]),
+                ("final_speed_z", [row["final_speed_z"] for row in episode_rows]),
+            ],
+        )
+        save_svg_line_chart(
+            plots_dir / "episode_final_goal_rel_xy.svg",
+            "Episode Final Goal Relative XY",
+            episodes,
+            [
+                ("goal_rel_x", [row["final_goal_rel_x"] for row in episode_rows]),
+                ("goal_rel_y", [row["final_goal_rel_y"] for row in episode_rows]),
+            ],
+        )
 
     print(f"[PPO TRAIN] saved SVG plots to {plots_dir}")
 
@@ -236,6 +329,10 @@ def save_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
         return
 
     try:
+        matplotlib_cache_dir = run_dir / "matplotlib_cache"
+        matplotlib_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_cache_dir))
+        logging.getLogger("matplotlib").setLevel(logging.WARNING)
         import matplotlib
 
         matplotlib.use("Agg")
@@ -250,7 +347,7 @@ def save_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
 
     if update_rows:
         updates = [row["update"] for row in update_rows]
-        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
         axes[0].plot(updates, [row["mean_rollout_reward"] for row in update_rows], label="mean rollout reward")
         axes[0].set_ylabel("reward")
         axes[0].grid(True, alpha=0.3)
@@ -262,12 +359,19 @@ def save_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
         axes[1].grid(True, alpha=0.3)
         axes[1].legend()
 
-        axes[2].bar(updates, [row["success_count"] for row in update_rows], label="success")
-        axes[2].bar(updates, [row["timeout_count"] for row in update_rows], bottom=[row["success_count"] for row in update_rows], label="timeout")
-        axes[2].set_ylabel("terminal episodes")
-        axes[2].set_xlabel("update")
-        axes[2].grid(True, axis="y", alpha=0.3)
+        axes[2].plot(updates, [row["mean_z_err"] for row in update_rows], label="mean z err")
+        axes[2].plot(updates, [row["mean_signed_z_err"] for row in update_rows], label="mean signed z err")
+        axes[2].plot(updates, [row["mean_speed_xy"] for row in update_rows], label="mean speed xy", alpha=0.75)
+        axes[2].set_ylabel("meters / mps")
+        axes[2].grid(True, alpha=0.3)
         axes[2].legend()
+
+        axes[3].bar(updates, [row["success_count"] for row in update_rows], label="success")
+        axes[3].bar(updates, [row["timeout_count"] for row in update_rows], bottom=[row["success_count"] for row in update_rows], label="timeout")
+        axes[3].set_ylabel("terminal episodes")
+        axes[3].set_xlabel("update")
+        axes[3].grid(True, axis="y", alpha=0.3)
+        axes[3].legend()
         fig.tight_layout()
         overview_path = plots_dir / "training_overview.png"
         fig.savefig(overview_path, dpi=150)
@@ -311,6 +415,31 @@ def save_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
         fig.savefig(episodes_path, dpi=150)
         plt.close(fig)
 
+        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+        axes[0].plot(episodes, [row["final_z_err"] for row in episode_rows], label="final z err")
+        axes[0].plot(episodes, [row["final_signed_z_err"] for row in episode_rows], label="final signed z err")
+        axes[0].set_ylabel("meters")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(episodes, [row["final_goal_rel_x"] for row in episode_rows], label="goal rel x")
+        axes[1].plot(episodes, [row["final_goal_rel_y"] for row in episode_rows], label="goal rel y")
+        axes[1].set_ylabel("meters")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+
+        axes[2].plot(episodes, [row["final_cmd_roll_rate"] for row in episode_rows], label="cmd roll rate")
+        axes[2].plot(episodes, [row["final_cmd_pitch_rate"] for row in episode_rows], label="cmd pitch rate")
+        axes[2].plot(episodes, [row["final_cmd_thrust"] for row in episode_rows], label="cmd thrust")
+        axes[2].set_ylabel("command")
+        axes[2].set_xlabel("episode")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+        fig.tight_layout()
+        diagnostics_path = plots_dir / "episode_diagnostics.png"
+        fig.savefig(diagnostics_path, dpi=150)
+        plt.close(fig)
+
     print(f"[PPO TRAIN] saved plots to {plots_dir}")
 
 
@@ -326,13 +455,15 @@ def make_env(args):
         max_roll_rate=0.080,
         max_pitch_rate=0.080,
         max_yaw_rate=0.010,
-        hover_thrust=0.60,
-        thrust_delta=0.015,
-        thrust_min=0.50,
-        thrust_max=0.72,
+        hover_thrust=args.hover_thrust,
+        thrust_delta=args.thrust_delta,
+        thrust_min=args.thrust_min,
+        thrust_max=args.thrust_max,
         residual_gain=args.residual_gain,
         goal_feedback_scale=args.goal_feedback_scale,
         attitude_feedback_scale=args.attitude_feedback_scale,
+        z_pos_gain=args.z_pos_gain,
+        z_vel_gain=args.z_vel_gain,
     )
     safety_limits = SafetyLimits(
         min_altitude=0.35,
@@ -355,6 +486,7 @@ def make_env(args):
         stabilize_after_takeoff_sim_sec=5.0,
         recover_timeout_sim_sec=25.0,
         recover_tolerance_m=0.5,
+        recover_z_tolerance_m=args.recover_z_tolerance_m,
         start_logging=not args.no_pegasus_log,
         log_dir=args.pegasus_log_dir,
         reward_alive=args.reward_alive,
@@ -404,6 +536,9 @@ def main():
     metrics_dir = run_dir / "metrics"
     model_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    terminal_log = None
+    if not args.no_terminal_log:
+        terminal_log = start_terminal_log(run_dir)
     (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
     update_metrics_path = metrics_dir / "update_metrics.csv"
     episode_metrics_path = metrics_dir / "episode_metrics.csv"
@@ -422,6 +557,13 @@ def main():
     print(f"residual_gain: {args.residual_gain}")
     print(f"goal_feedback_scale: {args.goal_feedback_scale}")
     print(f"attitude_feedback_scale: {args.attitude_feedback_scale}")
+    print(
+        f"thrust: hover={args.hover_thrust}, delta={args.thrust_delta}, "
+        f"range=[{args.thrust_min}, {args.thrust_max}]"
+    )
+    print(f"z_pos_gain: {args.z_pos_gain}")
+    print(f"z_vel_gain: {args.z_vel_gain}")
+    print(f"recover_z_tolerance_m: {args.recover_z_tolerance_m}")
     print(
         f"goal_xy_radius: [{args.goal_xy_radius_min}, {args.goal_xy_radius_max}], "
         f"goal_z_delta_max: {args.goal_z_delta_max}, "
@@ -458,6 +600,11 @@ def main():
             value_buf = []
             stats_reasons = Counter()
             stats_xy = []
+            stats_z = []
+            stats_signed_z = []
+            stats_progress = []
+            stats_speed_xy = []
+            stats_speed_z = []
             stats_rewards = []
 
             for _ in range(args.rollout_steps):
@@ -482,9 +629,19 @@ def main():
                     stats_xy.append(xy_err)
                     episode_xy_errs.append(xy_err)
                 if info.get("z_err") is not None:
-                    episode_z_errs.append(float(info["z_err"]))
+                    z_err = float(info["z_err"])
+                    stats_z.append(z_err)
+                    episode_z_errs.append(z_err)
                 if info.get("goal_distance") is not None:
                     episode_goal_distances.append(float(info["goal_distance"]))
+                if info.get("signed_z_err") is not None:
+                    stats_signed_z.append(float(info["signed_z_err"]))
+                if info.get("goal_xy_progress") is not None:
+                    stats_progress.append(float(info["goal_xy_progress"]))
+                if info.get("speed_xy") is not None:
+                    stats_speed_xy.append(float(info["speed_xy"]))
+                if info.get("speed_z") is not None:
+                    stats_speed_z.append(float(info["speed_z"]))
 
                 obs = next_obs
                 total_steps += 1
@@ -498,10 +655,20 @@ def main():
                         "final_goal_xy_err": float(info["xy_err"]) if info.get("xy_err") is not None else 0.0,
                         "final_z_err": float(info["z_err"]) if info.get("z_err") is not None else 0.0,
                         "final_goal_distance": float(info["goal_distance"]) if info.get("goal_distance") is not None else 0.0,
+                        "final_goal_rel_x": float(info["goal_rel_x"]) if info.get("goal_rel_x") is not None else 0.0,
+                        "final_goal_rel_y": float(info["goal_rel_y"]) if info.get("goal_rel_y") is not None else 0.0,
+                        "final_goal_rel_z": float(info["goal_rel_z"]) if info.get("goal_rel_z") is not None else 0.0,
+                        "final_signed_z_err": float(info["signed_z_err"]) if info.get("signed_z_err") is not None else 0.0,
                         "final_speed_xy": float(info["speed_xy"]) if info.get("speed_xy") is not None else 0.0,
                         "final_speed_z": float(info["speed_z"]) if info.get("speed_z") is not None else 0.0,
+                        "final_cmd_roll_rate": float(info["cmd_roll_rate"]) if info.get("cmd_roll_rate") is not None else 0.0,
+                        "final_cmd_pitch_rate": float(info["cmd_pitch_rate"]) if info.get("cmd_pitch_rate") is not None else 0.0,
+                        "final_cmd_yaw_rate": float(info["cmd_yaw_rate"]) if info.get("cmd_yaw_rate") is not None else 0.0,
+                        "final_cmd_thrust": float(info["cmd_thrust"]) if info.get("cmd_thrust") is not None else 0.0,
                         "mean_goal_xy_err": float(np.mean(episode_xy_errs)) if episode_xy_errs else 0.0,
                         "max_goal_xy_err": float(np.max(episode_xy_errs)) if episode_xy_errs else 0.0,
+                        "mean_z_err": float(np.mean(episode_z_errs)) if episode_z_errs else 0.0,
+                        "max_z_err": float(np.max(episode_z_errs)) if episode_z_errs else 0.0,
                         "success": str(info.get("done_reason", "unknown")) == "success",
                     }
                     episode_rows.append(episode_row)
@@ -563,6 +730,14 @@ def main():
             mean_reward = float(np.mean(stats_rewards)) if stats_rewards else 0.0
             mean_xy = float(np.mean(stats_xy)) if stats_xy else 0.0
             max_xy = float(np.max(stats_xy)) if stats_xy else 0.0
+            mean_z = float(np.mean(stats_z)) if stats_z else 0.0
+            max_z = float(np.max(stats_z)) if stats_z else 0.0
+            mean_signed_z = float(np.mean(stats_signed_z)) if stats_signed_z else 0.0
+            mean_progress = float(np.mean(stats_progress)) if stats_progress else 0.0
+            mean_speed_xy = float(np.mean(stats_speed_xy)) if stats_speed_xy else 0.0
+            max_speed_xy = float(np.max(stats_speed_xy)) if stats_speed_xy else 0.0
+            mean_speed_z = float(np.mean(stats_speed_z)) if stats_speed_z else 0.0
+            max_speed_z = float(np.max(stats_speed_z)) if stats_speed_z else 0.0
             policy_loss_mean = float(np.mean(pg_losses)) if pg_losses else 0.0
             value_loss_mean = float(np.mean(value_losses)) if value_losses else 0.0
             entropy_mean = float(np.mean(entropies)) if entropies else 0.0
@@ -579,6 +754,14 @@ def main():
                 "mean_rollout_reward": mean_reward,
                 "mean_xy_err": mean_xy,
                 "max_xy_err": max_xy,
+                "mean_z_err": mean_z,
+                "max_z_err": max_z,
+                "mean_signed_z_err": mean_signed_z,
+                "mean_goal_xy_progress": mean_progress,
+                "mean_speed_xy": mean_speed_xy,
+                "max_speed_xy": max_speed_xy,
+                "mean_speed_z": mean_speed_z,
+                "max_speed_z": max_speed_z,
                 "success_count": success_count,
                 "timeout_count": timeout_count,
                 "other_done_count": other_done_count,
@@ -594,6 +777,10 @@ def main():
             print(f"  mean_rollout_reward: {mean_reward:.4f}")
             print(f"  mean_xy_err: {mean_xy:.3f}")
             print(f"  max_xy_err: {max_xy:.3f}")
+            print(f"  mean_z_err: {mean_z:.3f}")
+            print(f"  mean_signed_z_err: {mean_signed_z:.3f}")
+            print(f"  mean_goal_xy_progress: {mean_progress:.4f}")
+            print(f"  mean_speed_xy: {mean_speed_xy:.3f}")
             print(f"  done_reasons: {dict(stats_reasons)}")
             print(f"  policy_loss: {policy_loss_mean:.6f}")
             print(f"  value_loss: {value_loss_mean:.6f}")
@@ -606,6 +793,12 @@ def main():
         print(f"[PPO TRAIN] saved update metrics to {update_metrics_path}")
         print(f"[PPO TRAIN] saved episode metrics to {episode_metrics_path}")
         save_training_plots(run_dir, update_rows, episode_rows)
+        if terminal_log is not None:
+            log_file, original_stdout, original_stderr = terminal_log
+            print(f"[PPO TRAIN] saved terminal output to {log_file.name}")
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_file.close()
 
 
 if __name__ == "__main__":

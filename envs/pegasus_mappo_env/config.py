@@ -24,6 +24,7 @@ class TwoDroneEnvConfig:
     stabilize_after_takeoff_sim_sec: float = 1.5
     recover_timeout_sim_sec: float = 12.0
     recover_tolerance_m: float = 0.60
+    recover_z_tolerance_m: float = 0.50
     auto_takeoff_on_first_reset: bool = True
     start_logging: bool = True
     log_dir: str = "./log_folder"

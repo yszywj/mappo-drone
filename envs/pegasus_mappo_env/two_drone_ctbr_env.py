@@ -400,7 +400,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
 
                 if (
                     xy_err >= self.config.recover_tolerance_m
-                    or z_err >= 0.8
+                    or z_err >= self.config.recover_z_tolerance_m
                     or speed_xy >= 0.25
                     or speed_z >= 0.25
                 ):
@@ -431,7 +431,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
 
                         if (
                             xy_err >= self.config.recover_tolerance_m
-                            or z_err >= 0.8
+                            or z_err >= self.config.recover_z_tolerance_m
                             or speed_xy >= 0.20
                             or speed_z >= 0.20
                         ):
@@ -686,7 +686,7 @@ class TwoDroneCTBREnv(gym.Env if hasattr(gym, "Env") else object):
 
             if (
                 xy_err > tolerance_m
-                or z_err > 0.5
+                or z_err > self.config.recover_z_tolerance_m
                 or speed_xy > 0.20
                 or speed_z > 0.20
             ):

@@ -20,6 +20,7 @@ class SingleDroneEnvConfig:
     stabilize_after_takeoff_sim_sec: float = 5.0
     recover_timeout_sim_sec: float = 25.0
     recover_tolerance_m: float = 0.5
+    recover_z_tolerance_m: float = 0.25
     auto_takeoff_on_first_reset: bool = True
 
     start_logging: bool = True

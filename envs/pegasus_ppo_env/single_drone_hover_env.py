@@ -366,9 +366,18 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         z_err = None
         goal_dist = None
         home_xy_err = None
+        goal_rel_x = None
+        goal_rel_y = None
+        goal_rel_z = None
+        signed_z_err = None
         speed_xy = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2)
         speed_z = abs(float(obs.vz))
+        cmd = self.agent.state.prev_action
         if goal is not None:
+            goal_rel_x = goal.x - float(obs.x)
+            goal_rel_y = goal.y - float(obs.y)
+            goal_rel_z = goal.z - float(obs.z)
+            signed_z_err = float(obs.z) - goal.z
             xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
             z_err = abs(float(obs.z) - goal.z)
             goal_dist = goal_distance(obs, goal)
@@ -382,9 +391,17 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
             "z_err": z_err,
             "goal_distance": goal_dist,
             "goal_xy_progress": self._last_goal_xy_progress,
+            "goal_rel_x": goal_rel_x,
+            "goal_rel_y": goal_rel_y,
+            "goal_rel_z": goal_rel_z,
+            "signed_z_err": signed_z_err,
             "home_xy_err": home_xy_err,
             "speed_xy": speed_xy,
             "speed_z": speed_z,
+            "cmd_roll_rate": float(cmd[0]),
+            "cmd_pitch_rate": float(cmd[1]),
+            "cmd_yaw_rate": float(cmd[2]),
+            "cmd_thrust": float(cmd[3]),
             "goal": None if goal is None else (goal.x, goal.y, goal.z),
             "home": None if home is None else (home.x, home.y, home.z),
         }
@@ -401,7 +418,7 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         speed_z = abs(float(obs.vz))
         return (
             xy_err <= self.config.recover_tolerance_m
-            and z_err <= 0.5
+            and z_err <= self.config.recover_z_tolerance_m
             and speed_xy <= 0.20
             and speed_z <= 0.20
         )
@@ -411,7 +428,8 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         print(
             f"[PPO RESET READY] episode={self._episode_id}, "
             f"goal_xy_err={info['xy_err']:.2f}, z_err={info['z_err']:.2f}, "
-            f"speed_xy={info['speed_xy']:.2f}"
+            f"signed_z_err={info['signed_z_err']:.2f}, "
+            f"speed_xy={info['speed_xy']:.2f}, speed_z={info['speed_z']:.2f}"
         )
 
     def _print_done_state(self, reason: str) -> None:
@@ -424,10 +442,14 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
             return
         xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
         z_err = abs(float(obs.z) - goal.z)
+        signed_z_err = float(obs.z) - goal.z
+        goal_rel_x = goal.x - float(obs.x)
+        goal_rel_y = goal.y - float(obs.y)
         cmd = self.agent.state.prev_action
         print(
             f"[PPO ENV DONE] episode={self._episode_id}, step={self._step_id}, reason={reason}, "
-            f"goal_xy_err={xy_err:.2f}, z_err={z_err:.2f}, "
+            f"goal_xy_err={xy_err:.2f}, z_err={z_err:.2f}, signed_z_err={signed_z_err:.2f}, "
+            f"goal_rel=({goal_rel_x:.2f},{goal_rel_y:.2f}), "
             f"vx={obs.vx:.2f}, vy={obs.vy:.2f}, vz={obs.vz:.2f}, "
             f"roll={obs.roll:.3f}, pitch={obs.pitch:.3f}, yaw={obs.yaw:.3f}, "
             f"cmd_rate=({cmd[0]:.3f},{cmd[1]:.3f},{cmd[2]:.3f}), cmd_thrust={cmd[3]:.3f}"
