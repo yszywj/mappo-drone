@@ -26,6 +26,21 @@ from envs.pegasus_ppo_env.single_drone_hover_env import SingleDroneHoverEnv
 from ppo.actor_critic import ActorCritic
 
 
+REWARD_TERM_KEYS = [
+    "reward_alive",
+    "reward_progress",
+    "reward_distance",
+    "reward_z",
+    "reward_speed",
+    "reward_tilt",
+    "reward_control",
+    "reward_goal_zone",
+    "reward_dwell",
+    "reward_success",
+    "reward_crash",
+    "reward_timeout",
+]
+
 UPDATE_METRIC_FIELDS = [
     "update",
     "total_steps",
@@ -36,6 +51,9 @@ UPDATE_METRIC_FIELDS = [
     "max_z_err",
     "mean_signed_z_err",
     "mean_goal_xy_progress",
+    "goal_zone_fraction",
+    "mean_goal_dwell_fraction",
+    "max_goal_dwell_fraction",
     "mean_speed_xy",
     "max_speed_xy",
     "mean_speed_z",
@@ -44,6 +62,24 @@ UPDATE_METRIC_FIELDS = [
     "timeout_count",
     "other_done_count",
     "done_reasons",
+    "approx_kl",
+    "clip_fraction",
+    "explained_variance",
+    "action_mean",
+    "action_std",
+    "action_abs_mean",
+    "mean_reward_alive",
+    "mean_reward_progress",
+    "mean_reward_distance",
+    "mean_reward_z",
+    "mean_reward_speed",
+    "mean_reward_tilt",
+    "mean_reward_control",
+    "mean_reward_goal_zone",
+    "mean_reward_dwell",
+    "mean_reward_success",
+    "mean_reward_crash",
+    "mean_reward_timeout",
     "policy_loss",
     "value_loss",
     "entropy",
@@ -72,6 +108,22 @@ EPISODE_METRIC_FIELDS = [
     "max_goal_xy_err",
     "mean_z_err",
     "max_z_err",
+    "final_inside_goal_zone",
+    "final_goal_dwell_steps",
+    "final_goal_dwell_fraction",
+    "max_goal_dwell_fraction",
+    "return_alive",
+    "return_progress",
+    "return_distance",
+    "return_z",
+    "return_speed",
+    "return_tilt",
+    "return_control",
+    "return_goal_zone",
+    "return_dwell",
+    "return_success",
+    "return_crash",
+    "return_timeout",
     "success",
 ]
 
@@ -117,15 +169,19 @@ def parse_args():
     parser.add_argument("--goal_z_tolerance_m", type=float, default=0.35)
     parser.add_argument("--goal_speed_xy_tolerance_mps", type=float, default=0.25)
     parser.add_argument("--goal_speed_z_tolerance_mps", type=float, default=0.25)
+    parser.add_argument("--success_dwell_sec", type=float, default=2.0)
     parser.add_argument("--reward_alive", type=float, default=0.0)
     parser.add_argument("--reward_progress_scale", type=float, default=3.0)
     parser.add_argument("--reward_distance_scale", type=float, default=0.10)
     parser.add_argument("--reward_z_scale", type=float, default=0.20)
+    parser.add_argument("--reward_goal_zone", type=float, default=0.05)
+    parser.add_argument("--reward_dwell_scale", type=float, default=0.05)
     parser.add_argument("--reward_success", type=float, default=8.0)
     parser.add_argument("--reward_timeout", type=float, default=0.0)
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
     parser.add_argument("--no_pegasus_log", action="store_true", default=False)
     parser.add_argument("--no_terminal_log", action="store_true", default=False)
+    parser.add_argument("--no_tensorboard", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -166,6 +222,70 @@ def start_terminal_log(run_dir: Path):
     sys.stderr = TeeStream(original_stderr, log_file)
     print(f"[PPO TRAIN] terminal output is being saved to {log_path}")
     return log_file, original_stdout, original_stderr
+
+
+def start_tensorboard_writer(run_dir: Path):
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception as exc:
+        print(f"[PPO TRAIN] TensorBoard unavailable ({exc}); install tensorboard to enable it")
+        return None
+
+    tb_dir = run_dir / "tensorboard"
+    writer = SummaryWriter(log_dir=str(tb_dir))
+    print(f"[PPO TRAIN] TensorBoard logs are being saved to {tb_dir}")
+    return writer
+
+
+def explained_variance(y_pred: np.ndarray, y_true: np.ndarray) -> float:
+    var_y = float(np.var(y_true))
+    if var_y < 1e-12:
+        return 0.0
+    return float(1.0 - np.var(y_true - y_pred) / var_y)
+
+
+def write_tensorboard_scalars(writer, metrics: dict, step: int) -> None:
+    if writer is None:
+        return
+
+    scalar_groups = {
+        "rollout": [
+            "mean_rollout_reward",
+            "mean_xy_err",
+            "max_xy_err",
+            "mean_z_err",
+            "mean_signed_z_err",
+            "mean_goal_xy_progress",
+            "goal_zone_fraction",
+            "mean_goal_dwell_fraction",
+            "max_goal_dwell_fraction",
+            "mean_speed_xy",
+            "mean_speed_z",
+        ],
+        "ppo": [
+            "policy_loss",
+            "value_loss",
+            "entropy",
+            "approx_kl",
+            "clip_fraction",
+            "explained_variance",
+        ],
+        "action": [
+            "action_mean",
+            "action_std",
+            "action_abs_mean",
+        ],
+        "reward_terms": [f"mean_{key}" for key in REWARD_TERM_KEYS],
+        "done": [
+            "success_count",
+            "timeout_count",
+            "other_done_count",
+        ],
+    }
+    for group, keys in scalar_groups.items():
+        for key in keys:
+            if key in metrics:
+                writer.add_scalar(f"{group}/{key}", float(metrics[key]), step)
 
 
 def save_svg_line_chart(path: Path, title: str, x_values, series) -> None:
@@ -276,6 +396,38 @@ def save_svg_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
             [("mean_goal_xy_progress", [row["mean_goal_xy_progress"] for row in update_rows])],
         )
         save_svg_line_chart(
+            plots_dir / "ppo_diagnostics.svg",
+            "PPO Diagnostics",
+            updates,
+            [
+                ("approx_kl", [row["approx_kl"] for row in update_rows]),
+                ("clip_fraction", [row["clip_fraction"] for row in update_rows]),
+                ("explained_variance", [row["explained_variance"] for row in update_rows]),
+            ],
+        )
+        save_svg_line_chart(
+            plots_dir / "action_stats.svg",
+            "PPO Action Statistics",
+            updates,
+            [
+                ("action_mean", [row["action_mean"] for row in update_rows]),
+                ("action_std", [row["action_std"] for row in update_rows]),
+                ("action_abs_mean", [row["action_abs_mean"] for row in update_rows]),
+            ],
+        )
+        save_svg_line_chart(
+            plots_dir / "reward_components.svg",
+            "PPO Reward Components",
+            updates,
+            [
+                ("progress", [row["mean_reward_progress"] for row in update_rows]),
+                ("distance", [row["mean_reward_distance"] for row in update_rows]),
+                ("z", [row["mean_reward_z"] for row in update_rows]),
+                ("speed", [row["mean_reward_speed"] for row in update_rows]),
+                ("control", [row["mean_reward_control"] for row in update_rows]),
+            ],
+        )
+        save_svg_line_chart(
             plots_dir / "losses.svg",
             "PPO Losses And Entropy",
             updates,
@@ -283,6 +435,16 @@ def save_svg_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
                 ("policy_loss", [row["policy_loss"] for row in update_rows]),
                 ("value_loss", [row["value_loss"] for row in update_rows]),
                 ("entropy", [row["entropy"] for row in update_rows]),
+            ],
+        )
+        save_svg_line_chart(
+            plots_dir / "goal_dwell.svg",
+            "Goal Zone And Dwell",
+            updates,
+            [
+                ("goal_zone_fraction", [row["goal_zone_fraction"] for row in update_rows]),
+                ("mean_dwell_fraction", [row["mean_goal_dwell_fraction"] for row in update_rows]),
+                ("max_dwell_fraction", [row["max_goal_dwell_fraction"] for row in update_rows]),
             ],
         )
 
@@ -318,6 +480,19 @@ def save_svg_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
             [
                 ("goal_rel_x", [row["final_goal_rel_x"] for row in episode_rows]),
                 ("goal_rel_y", [row["final_goal_rel_y"] for row in episode_rows]),
+            ],
+        )
+        save_svg_line_chart(
+            plots_dir / "episode_reward_components.svg",
+            "Episode Reward Components",
+            episodes,
+            [
+                ("success", [row["return_success"] for row in episode_rows]),
+                ("progress", [row["return_progress"] for row in episode_rows]),
+                ("distance", [row["return_distance"] for row in episode_rows]),
+                ("goal_zone", [row["return_goal_zone"] for row in episode_rows]),
+                ("dwell", [row["return_dwell"] for row in episode_rows]),
+                ("z", [row["return_z"] for row in episode_rows]),
             ],
         )
 
@@ -393,6 +568,62 @@ def save_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
         fig.savefig(losses_path, dpi=150)
         plt.close(fig)
 
+        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+        axes[0].plot(updates, [row["approx_kl"] for row in update_rows], label="approx kl")
+        axes[0].plot(updates, [row["clip_fraction"] for row in update_rows], label="clip fraction")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+        axes[1].plot(updates, [row["explained_variance"] for row in update_rows], label="explained variance", color="tab:orange")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+        axes[2].plot(updates, [row["action_mean"] for row in update_rows], label="action mean")
+        axes[2].plot(updates, [row["action_std"] for row in update_rows], label="action std")
+        axes[2].plot(updates, [row["action_abs_mean"] for row in update_rows], label="action abs mean")
+        axes[2].set_xlabel("update")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+        fig.tight_layout()
+        diagnostics_path = plots_dir / "ppo_diagnostics.png"
+        fig.savefig(diagnostics_path, dpi=150)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+        axes[0].plot(updates, [row["mean_reward_progress"] for row in update_rows], label="progress")
+        axes[0].plot(updates, [row["mean_reward_distance"] for row in update_rows], label="distance")
+        axes[0].plot(updates, [row["mean_reward_z"] for row in update_rows], label="z")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+        axes[1].plot(updates, [row["mean_reward_speed"] for row in update_rows], label="speed")
+        axes[1].plot(updates, [row["mean_reward_tilt"] for row in update_rows], label="tilt")
+        axes[1].plot(updates, [row["mean_reward_control"] for row in update_rows], label="control")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+        axes[2].plot(updates, [row["mean_reward_goal_zone"] for row in update_rows], label="goal zone")
+        axes[2].plot(updates, [row["mean_reward_dwell"] for row in update_rows], label="dwell")
+        axes[2].plot(updates, [row["mean_reward_success"] for row in update_rows], label="success")
+        axes[2].plot(updates, [row["mean_reward_crash"] for row in update_rows], label="crash")
+        axes[2].plot(updates, [row["mean_reward_timeout"] for row in update_rows], label="timeout")
+        axes[2].set_xlabel("update")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
+        fig.tight_layout()
+        reward_path = plots_dir / "reward_components.png"
+        fig.savefig(reward_path, dpi=150)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(updates, [row["goal_zone_fraction"] for row in update_rows], label="goal zone fraction")
+        ax.plot(updates, [row["mean_goal_dwell_fraction"] for row in update_rows], label="mean dwell fraction")
+        ax.plot(updates, [row["max_goal_dwell_fraction"] for row in update_rows], label="max dwell fraction")
+        ax.set_xlabel("update")
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        dwell_path = plots_dir / "goal_dwell.png"
+        fig.savefig(dwell_path, dpi=150)
+        plt.close(fig)
+
     if episode_rows:
         episodes = [row["episode"] for row in episode_rows]
         final_xy = [row["final_goal_xy_err"] for row in episode_rows]
@@ -438,6 +669,31 @@ def save_training_plots(run_dir: Path, update_rows, episode_rows) -> None:
         fig.tight_layout()
         diagnostics_path = plots_dir / "episode_diagnostics.png"
         fig.savefig(diagnostics_path, dpi=150)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        axes[0].plot(episodes, [row["return_success"] for row in episode_rows], label="success")
+        axes[0].plot(episodes, [row["return_progress"] for row in episode_rows], label="progress")
+        axes[0].plot(episodes, [row["return_distance"] for row in episode_rows], label="distance")
+        axes[0].plot(episodes, [row["return_z"] for row in episode_rows], label="z")
+        axes[0].set_ylabel("episode return")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(episodes, [row["return_goal_zone"] for row in episode_rows], label="goal zone")
+        axes[1].plot(episodes, [row["return_dwell"] for row in episode_rows], label="dwell")
+        axes[1].plot(episodes, [row["return_speed"] for row in episode_rows], label="speed")
+        axes[1].plot(episodes, [row["return_tilt"] for row in episode_rows], label="tilt")
+        axes[1].plot(episodes, [row["return_control"] for row in episode_rows], label="control")
+        axes[1].plot(episodes, [row["return_crash"] for row in episode_rows], label="crash")
+        axes[1].plot(episodes, [row["return_timeout"] for row in episode_rows], label="timeout")
+        axes[1].set_ylabel("episode return")
+        axes[1].set_xlabel("episode")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend()
+        fig.tight_layout()
+        reward_episode_path = plots_dir / "episode_reward_components.png"
+        fig.savefig(reward_episode_path, dpi=150)
         plt.close(fig)
 
     print(f"[PPO TRAIN] saved plots to {plots_dir}")
@@ -504,6 +760,9 @@ def make_env(args):
         goal_z_tolerance_m=args.goal_z_tolerance_m,
         goal_speed_xy_tolerance_mps=args.goal_speed_xy_tolerance_mps,
         goal_speed_z_tolerance_mps=args.goal_speed_z_tolerance_mps,
+        success_dwell_sec=args.success_dwell_sec,
+        reward_goal_zone=args.reward_goal_zone,
+        reward_dwell_scale=args.reward_dwell_scale,
         action_limits=action_limits,
         safety_limits=safety_limits,
     )
@@ -539,6 +798,9 @@ def main():
     terminal_log = None
     if not args.no_terminal_log:
         terminal_log = start_terminal_log(run_dir)
+    writer = None
+    if not args.no_tensorboard:
+        writer = start_tensorboard_writer(run_dir)
     (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
     update_metrics_path = metrics_dir / "update_metrics.csv"
     episode_metrics_path = metrics_dir / "episode_metrics.csv"
@@ -574,9 +836,12 @@ def main():
         f"success_speed_tolerance: xy={args.goal_speed_xy_tolerance_mps}, "
         f"z={args.goal_speed_z_tolerance_mps}"
     )
+    print(f"success_dwell_sec: {args.success_dwell_sec}")
     print(
         f"reward: progress={args.reward_progress_scale}, distance={args.reward_distance_scale}, "
-        f"z={args.reward_z_scale}, success={args.reward_success}, timeout={args.reward_timeout}"
+        f"z={args.reward_z_scale}, goal_zone={args.reward_goal_zone}, "
+        f"dwell={args.reward_dwell_scale}, success={args.reward_success}, "
+        f"timeout={args.reward_timeout}"
     )
     print(f"init_action_std: {args.init_action_std}")
     print("=" * 80)
@@ -590,6 +855,8 @@ def main():
     episode_xy_errs = []
     episode_z_errs = []
     episode_goal_distances = []
+    episode_dwell_fractions = []
+    episode_reward_terms = {key: 0.0 for key in REWARD_TERM_KEYS}
     try:
         while total_steps < args.num_env_steps:
             obs_buf = []
@@ -603,9 +870,12 @@ def main():
             stats_z = []
             stats_signed_z = []
             stats_progress = []
+            stats_inside_goal_zone = []
+            stats_dwell_fraction = []
             stats_speed_xy = []
             stats_speed_z = []
             stats_rewards = []
+            stats_reward_terms = {key: [] for key in REWARD_TERM_KEYS}
 
             for _ in range(args.rollout_steps):
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
@@ -638,10 +908,19 @@ def main():
                     stats_signed_z.append(float(info["signed_z_err"]))
                 if info.get("goal_xy_progress") is not None:
                     stats_progress.append(float(info["goal_xy_progress"]))
+                stats_inside_goal_zone.append(1.0 if info.get("inside_goal_zone") else 0.0)
+                if info.get("goal_dwell_fraction") is not None:
+                    dwell_fraction = float(info["goal_dwell_fraction"])
+                    stats_dwell_fraction.append(dwell_fraction)
+                    episode_dwell_fractions.append(dwell_fraction)
                 if info.get("speed_xy") is not None:
                     stats_speed_xy.append(float(info["speed_xy"]))
                 if info.get("speed_z") is not None:
                     stats_speed_z.append(float(info["speed_z"]))
+                for key in REWARD_TERM_KEYS:
+                    value = float(info.get(key, 0.0))
+                    stats_reward_terms[key].append(value)
+                    episode_reward_terms[key] += value
 
                 obs = next_obs
                 total_steps += 1
@@ -669,6 +948,22 @@ def main():
                         "max_goal_xy_err": float(np.max(episode_xy_errs)) if episode_xy_errs else 0.0,
                         "mean_z_err": float(np.mean(episode_z_errs)) if episode_z_errs else 0.0,
                         "max_z_err": float(np.max(episode_z_errs)) if episode_z_errs else 0.0,
+                        "final_inside_goal_zone": bool(info.get("inside_goal_zone", False)),
+                        "final_goal_dwell_steps": int(info.get("goal_dwell_steps", 0)),
+                        "final_goal_dwell_fraction": float(info.get("goal_dwell_fraction", 0.0)),
+                        "max_goal_dwell_fraction": float(np.max(episode_dwell_fractions)) if episode_dwell_fractions else 0.0,
+                        "return_alive": float(episode_reward_terms["reward_alive"]),
+                        "return_progress": float(episode_reward_terms["reward_progress"]),
+                        "return_distance": float(episode_reward_terms["reward_distance"]),
+                        "return_z": float(episode_reward_terms["reward_z"]),
+                        "return_speed": float(episode_reward_terms["reward_speed"]),
+                        "return_tilt": float(episode_reward_terms["reward_tilt"]),
+                        "return_control": float(episode_reward_terms["reward_control"]),
+                        "return_goal_zone": float(episode_reward_terms["reward_goal_zone"]),
+                        "return_dwell": float(episode_reward_terms["reward_dwell"]),
+                        "return_success": float(episode_reward_terms["reward_success"]),
+                        "return_crash": float(episode_reward_terms["reward_crash"]),
+                        "return_timeout": float(episode_reward_terms["reward_timeout"]),
                         "success": str(info.get("done_reason", "unknown")) == "success",
                     }
                     episode_rows.append(episode_row)
@@ -677,6 +972,8 @@ def main():
                     episode_xy_errs = []
                     episode_z_errs = []
                     episode_goal_distances = []
+                    episode_dwell_fractions = []
+                    episode_reward_terms = {key: 0.0 for key in REWARD_TERM_KEYS}
                     obs, _ = env.reset()
                 if total_steps >= args.num_env_steps:
                     break
@@ -701,6 +998,8 @@ def main():
             pg_losses = []
             value_losses = []
             entropies = []
+            approx_kls = []
+            clip_fractions = []
 
             for _ in range(args.ppo_epoch):
                 indices = np.arange(batch_size)
@@ -708,7 +1007,8 @@ def main():
                 for start in range(0, batch_size, mini_batch_size):
                     mb = indices[start:start + mini_batch_size]
                     new_logprob, entropy, value = policy.evaluate_actions(obs_tensor[mb], action_tensor[mb])
-                    ratio = torch.exp(new_logprob - old_logprob_tensor[mb])
+                    log_ratio = new_logprob - old_logprob_tensor[mb]
+                    ratio = torch.exp(log_ratio)
                     surr1 = ratio * adv_tensor[mb]
                     surr2 = torch.clamp(ratio, 1.0 - args.clip_param, 1.0 + args.clip_param) * adv_tensor[mb]
                     policy_loss = -torch.min(surr1, surr2).mean()
@@ -724,6 +1024,11 @@ def main():
                     pg_losses.append(float(policy_loss.item()))
                     value_losses.append(float(value_loss.item()))
                     entropies.append(float(entropy_loss.item()))
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                        clip_fraction = ((ratio - 1.0).abs() > args.clip_param).float().mean()
+                    approx_kls.append(float(approx_kl.item()))
+                    clip_fractions.append(float(clip_fraction.item()))
 
             update += 1
             torch.save(policy.state_dict(), model_dir / "actor_critic.pt")
@@ -734,6 +1039,9 @@ def main():
             max_z = float(np.max(stats_z)) if stats_z else 0.0
             mean_signed_z = float(np.mean(stats_signed_z)) if stats_signed_z else 0.0
             mean_progress = float(np.mean(stats_progress)) if stats_progress else 0.0
+            goal_zone_fraction = float(np.mean(stats_inside_goal_zone)) if stats_inside_goal_zone else 0.0
+            mean_dwell_fraction = float(np.mean(stats_dwell_fraction)) if stats_dwell_fraction else 0.0
+            max_dwell_fraction = float(np.max(stats_dwell_fraction)) if stats_dwell_fraction else 0.0
             mean_speed_xy = float(np.mean(stats_speed_xy)) if stats_speed_xy else 0.0
             max_speed_xy = float(np.max(stats_speed_xy)) if stats_speed_xy else 0.0
             mean_speed_z = float(np.mean(stats_speed_z)) if stats_speed_z else 0.0
@@ -741,6 +1049,19 @@ def main():
             policy_loss_mean = float(np.mean(pg_losses)) if pg_losses else 0.0
             value_loss_mean = float(np.mean(value_losses)) if value_losses else 0.0
             entropy_mean = float(np.mean(entropies)) if entropies else 0.0
+            approx_kl_mean = float(np.mean(approx_kls)) if approx_kls else 0.0
+            clip_fraction_mean = float(np.mean(clip_fractions)) if clip_fractions else 0.0
+            with torch.no_grad():
+                value_pred = policy.value(obs_tensor).detach().cpu().numpy()
+            explained_var = explained_variance(value_pred, returns)
+            actions_np = np.asarray(action_buf, dtype=np.float32)
+            action_mean = float(np.mean(actions_np)) if actions_np.size else 0.0
+            action_std = float(np.std(actions_np)) if actions_np.size else 0.0
+            action_abs_mean = float(np.mean(np.abs(actions_np))) if actions_np.size else 0.0
+            mean_reward_terms = {
+                f"mean_{key}": float(np.mean(values)) if values else 0.0
+                for key, values in stats_reward_terms.items()
+            }
             success_count = int(stats_reasons.get("success", 0))
             timeout_count = int(stats_reasons.get("timeout", 0))
             other_done_count = int(sum(
@@ -758,6 +1079,9 @@ def main():
                 "max_z_err": max_z,
                 "mean_signed_z_err": mean_signed_z,
                 "mean_goal_xy_progress": mean_progress,
+                "goal_zone_fraction": goal_zone_fraction,
+                "mean_goal_dwell_fraction": mean_dwell_fraction,
+                "max_goal_dwell_fraction": max_dwell_fraction,
                 "mean_speed_xy": mean_speed_xy,
                 "max_speed_xy": max_speed_xy,
                 "mean_speed_z": mean_speed_z,
@@ -766,12 +1090,20 @@ def main():
                 "timeout_count": timeout_count,
                 "other_done_count": other_done_count,
                 "done_reasons": json.dumps(dict(stats_reasons), sort_keys=True),
+                "approx_kl": approx_kl_mean,
+                "clip_fraction": clip_fraction_mean,
+                "explained_variance": explained_var,
+                "action_mean": action_mean,
+                "action_std": action_std,
+                "action_abs_mean": action_abs_mean,
+                **mean_reward_terms,
                 "policy_loss": policy_loss_mean,
                 "value_loss": value_loss_mean,
                 "entropy": entropy_mean,
             }
             update_rows.append(update_row)
             append_csv_row(update_metrics_path, UPDATE_METRIC_FIELDS, update_row)
+            write_tensorboard_scalars(writer, update_row, total_steps)
             print("=" * 80)
             print(f"[PegasusPPO] update={update}, steps={total_steps}/{args.num_env_steps}")
             print(f"  mean_rollout_reward: {mean_reward:.4f}")
@@ -780,8 +1112,27 @@ def main():
             print(f"  mean_z_err: {mean_z:.3f}")
             print(f"  mean_signed_z_err: {mean_signed_z:.3f}")
             print(f"  mean_goal_xy_progress: {mean_progress:.4f}")
+            print(
+                f"  goal_zone_fraction: {goal_zone_fraction:.3f}, "
+                f"mean_goal_dwell_fraction: {mean_dwell_fraction:.3f}, "
+                f"max_goal_dwell_fraction: {max_dwell_fraction:.3f}"
+            )
             print(f"  mean_speed_xy: {mean_speed_xy:.3f}")
             print(f"  done_reasons: {dict(stats_reasons)}")
+            print(f"  approx_kl: {approx_kl_mean:.6f}")
+            print(f"  clip_fraction: {clip_fraction_mean:.3f}")
+            print(f"  explained_variance: {explained_var:.3f}")
+            print(f"  action_abs_mean: {action_abs_mean:.3f}")
+            print(
+                "  reward_terms: "
+                f"progress={mean_reward_terms['mean_reward_progress']:.4f}, "
+                f"distance={mean_reward_terms['mean_reward_distance']:.4f}, "
+                f"z={mean_reward_terms['mean_reward_z']:.4f}, "
+                f"speed={mean_reward_terms['mean_reward_speed']:.4f}, "
+                f"control={mean_reward_terms['mean_reward_control']:.4f}, "
+                f"goal_zone={mean_reward_terms['mean_reward_goal_zone']:.4f}, "
+                f"dwell={mean_reward_terms['mean_reward_dwell']:.4f}"
+            )
             print(f"  policy_loss: {policy_loss_mean:.6f}")
             print(f"  value_loss: {value_loss_mean:.6f}")
             print(f"  entropy: {entropy_mean:.6f}")
@@ -793,6 +1144,10 @@ def main():
         print(f"[PPO TRAIN] saved update metrics to {update_metrics_path}")
         print(f"[PPO TRAIN] saved episode metrics to {episode_metrics_path}")
         save_training_plots(run_dir, update_rows, episode_rows)
+        if writer is not None:
+            writer.flush()
+            writer.close()
+            print(f"[PPO TRAIN] saved TensorBoard logs to {run_dir / 'tensorboard'}")
         if terminal_log is not None:
             log_file, original_stdout, original_stderr = terminal_log
             print(f"[PPO TRAIN] saved terminal output to {log_file.name}")

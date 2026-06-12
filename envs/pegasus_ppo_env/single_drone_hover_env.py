@@ -32,14 +32,13 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
     """
     Single-drone safe-hover task for PPO residual learning.
 
-    Observation layout, length 25, matching one MAPPO agent:
+    Observation layout, length 27:
       own pos(3), own vel(3), own attitude(3), own body rates(3),
       goal relative pos(3), other relative pos(3), other relative vel(3),
-      prev CTBR action(4).
+      prev CTBR action(4), inside goal zone(1), goal dwell fraction(1).
 
     For single-drone PPO, "other" is a virtual copy at the same pose/velocity,
-    so other relative pos/vel are zeros. This keeps the actor input compatible
-    with MAPPO while excluding multi-drone effects.
+    so other relative pos/vel are zeros.
     Action layout, length 4:
       normalized residual CTBR action in [-1, 1]; CTBRDroneRLAdapter combines it
       with the PD stabilizer according to action_limits.residual_gain.
@@ -56,13 +55,17 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         self._step_id = 0
         self._last_goal_xy_err: Optional[float] = None
         self._last_goal_xy_progress = 0.0
+        self._last_reward_terms: Dict[str, float] = {}
+        self._inside_goal_zone = False
+        self._goal_dwell_steps = 0
+        self._goal_dwell_fraction = 0.0
         self._timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         self.controller: Optional[CTBRController] = None
         self.agent: Optional[CTBRDroneRLAdapter] = None
         self.time_keeper = None
 
-        self.obs_dim = 25
+        self.obs_dim = 27
         self.action_dim = 4
 
         if spaces is not None:
@@ -135,9 +138,14 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
 
         self._step_id = 0
         self._episode_id += 1
+        self._last_reward_terms = {}
+        self._inside_goal_zone = False
+        self._goal_dwell_steps = 0
+        self._goal_dwell_fraction = 0.0
         home = self.agent.state.home
         assert home is not None
         self._sample_or_set_goal()
+        self._refresh_goal_zone_state(reset_dwell=True)
         self.agent.set_safe_ctbr()
         if hasattr(self.controller, "set_episode"):
             self.controller.set_episode(self._episode_id, phase="collect", step_id=0)
@@ -160,8 +168,8 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         ok_time = self.time_keeper.wait(self.config.step_dt_sim_sec, timeout=2.0)
         self._step_id += 1
 
-        obs = self._build_obs()
         reward, done, done_reason = self._compute_reward_done(action, ok_time=ok_time)
+        obs = self._build_obs()
         info = self._build_info(done_reason)
 
         if done:
@@ -288,11 +296,55 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         if home is None:
             raise RuntimeError("home must be set before building observation")
         goal = self.agent.state.goal or GoalPoint(home.x, home.y, home.z)
-        return observation_vector(
+        base_obs = observation_vector(
             own=obs,
             other=obs,
             goal=goal,
             prev_action=self.agent.state.prev_action,
+        )
+        dwell_obs = np.array([
+            1.0 if self._inside_goal_zone else 0.0,
+            self._goal_dwell_fraction,
+        ], dtype=np.float32)
+        return np.concatenate([base_obs, dwell_obs]).astype(np.float32)
+
+    @property
+    def _required_goal_dwell_steps(self) -> int:
+        if self.config.success_dwell_sec <= 0.0:
+            return 1
+        return max(1, int(math.ceil(self.config.success_dwell_sec / self.config.step_dt_sim_sec)))
+
+    def _goal_zone_status(self) -> Tuple[bool, float, float, float, float]:
+        assert self.agent is not None
+        obs = self.agent.get_observation()
+        home = self.agent.state.home
+        if home is None:
+            raise RuntimeError("home is not set during goal-zone check")
+        goal = self.agent.state.goal or GoalPoint(home.x, home.y, home.z)
+        xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
+        z_err = abs(float(obs.z) - goal.z)
+        speed_xy = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2)
+        speed_z = abs(float(obs.vz))
+        inside_goal_zone = (
+            xy_err <= self.config.goal_tolerance_m
+            and z_err <= self.config.goal_z_tolerance_m
+            and speed_xy <= self.config.goal_speed_xy_tolerance_mps
+            and speed_z <= self.config.goal_speed_z_tolerance_mps
+        )
+        return inside_goal_zone, xy_err, z_err, speed_xy, speed_z
+
+    def _refresh_goal_zone_state(self, reset_dwell: bool = False) -> None:
+        inside_goal_zone, _, _, _, _ = self._goal_zone_status()
+        self._inside_goal_zone = inside_goal_zone
+        if reset_dwell:
+            self._goal_dwell_steps = 0
+        elif inside_goal_zone:
+            self._goal_dwell_steps += 1
+        else:
+            self._goal_dwell_steps = 0
+        self._goal_dwell_fraction = min(
+            1.0,
+            float(self._goal_dwell_steps) / float(self._required_goal_dwell_steps),
         )
 
     def _compute_reward_done(self, action, ok_time: bool) -> Tuple[float, bool, str]:
@@ -302,20 +354,20 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         if home is None:
             raise RuntimeError("home is not set during reward computation")
 
-        reward = 0.0
         done = False
         done_reason = "running"
+        reward_crash = 0.0
 
         if not ok_time:
             done = True
             done_reason = "sim_time_timeout"
-            reward += self.config.reward_crash
+            reward_crash += self.config.reward_crash
 
         safety = self.agent.check_single_drone_safety()
         if safety.abnormal:
             done = True
             done_reason = safety.reason
-            reward += self.config.reward_crash
+            reward_crash += self.config.reward_crash
 
         goal = self.agent.state.goal or GoalPoint(home.x, home.y, home.z)
         xy_err = math.sqrt((float(obs.x) - goal.x) ** 2 + (float(obs.y) - goal.y) ** 2)
@@ -328,32 +380,78 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
         tilt = math.sqrt(float(obs.roll) ** 2 + float(obs.pitch) ** 2)
         control_penalty = float(np.mean(np.square(np.clip(action, -1.0, 1.0))))
 
-        reward += self.config.reward_alive
-        reward += self.config.reward_progress_scale * goal_xy_progress
-        reward -= self.config.reward_distance_scale * xy_err
-        reward -= self.config.reward_z_scale * z_err
-        reward -= 0.04 * speed
-        reward -= 0.08 * tilt
-        reward -= self.config.reward_control_scale * control_penalty
+        reward_alive = self.config.reward_alive
+        reward_progress = self.config.reward_progress_scale * goal_xy_progress
+        reward_distance = -self.config.reward_distance_scale * xy_err
+        reward_z = -self.config.reward_z_scale * z_err
+        reward_speed = -0.04 * speed
+        reward_tilt = -0.08 * tilt
+        reward_control = -self.config.reward_control_scale * control_penalty
+        reward_goal_zone = 0.0
+        reward_dwell = 0.0
+        reward_success = 0.0
+        reward_timeout = 0.0
 
         speed_xy = math.sqrt(float(obs.vx) ** 2 + float(obs.vy) ** 2)
         speed_z = abs(float(obs.vz))
-        goal_reached = (
+        inside_goal_zone = (
             xy_err <= self.config.goal_tolerance_m
             and z_err <= self.config.goal_z_tolerance_m
             and speed_xy <= self.config.goal_speed_xy_tolerance_mps
             and speed_z <= self.config.goal_speed_z_tolerance_mps
         )
+        self._inside_goal_zone = inside_goal_zone
+        if inside_goal_zone:
+            self._goal_dwell_steps += 1
+            self._goal_dwell_fraction = min(
+                1.0,
+                float(self._goal_dwell_steps) / float(self._required_goal_dwell_steps),
+            )
+            reward_goal_zone = self.config.reward_goal_zone
+            reward_dwell = self.config.reward_dwell_scale * self._goal_dwell_fraction
+        else:
+            self._goal_dwell_steps = 0
+            self._goal_dwell_fraction = 0.0
 
-        if not done and goal_reached:
+        if not done and self._goal_dwell_steps >= self._required_goal_dwell_steps:
             done = True
             done_reason = "success"
-            reward += self.config.reward_success
+            reward_success = self.config.reward_success
 
         if self._step_id >= self.config.episode_length and not done:
             done = True
             done_reason = "timeout"
-            reward += self.config.reward_timeout
+            reward_timeout = self.config.reward_timeout
+
+        reward = (
+            reward_alive
+            + reward_progress
+            + reward_distance
+            + reward_z
+            + reward_speed
+            + reward_tilt
+            + reward_control
+            + reward_goal_zone
+            + reward_dwell
+            + reward_success
+            + reward_crash
+            + reward_timeout
+        )
+        self._last_reward_terms = {
+            "reward_alive": float(reward_alive),
+            "reward_progress": float(reward_progress),
+            "reward_distance": float(reward_distance),
+            "reward_z": float(reward_z),
+            "reward_speed": float(reward_speed),
+            "reward_tilt": float(reward_tilt),
+            "reward_control": float(reward_control),
+            "reward_goal_zone": float(reward_goal_zone),
+            "reward_dwell": float(reward_dwell),
+            "reward_success": float(reward_success),
+            "reward_crash": float(reward_crash),
+            "reward_timeout": float(reward_timeout),
+            "reward_total": float(reward),
+        }
 
         return reward, done, done_reason
 
@@ -391,6 +489,12 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
             "z_err": z_err,
             "goal_distance": goal_dist,
             "goal_xy_progress": self._last_goal_xy_progress,
+            "inside_goal_zone": self._inside_goal_zone,
+            "goal_dwell_steps": self._goal_dwell_steps,
+            "required_goal_dwell_steps": self._required_goal_dwell_steps,
+            "goal_dwell_fraction": self._goal_dwell_fraction,
+            "goal_dwell_time_sec": self._goal_dwell_steps * self.config.step_dt_sim_sec,
+            "required_goal_dwell_time_sec": self._required_goal_dwell_steps * self.config.step_dt_sim_sec,
             "goal_rel_x": goal_rel_x,
             "goal_rel_y": goal_rel_y,
             "goal_rel_z": goal_rel_z,
@@ -404,6 +508,7 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
             "cmd_thrust": float(cmd[3]),
             "goal": None if goal is None else (goal.x, goal.y, goal.z),
             "home": None if home is None else (home.x, home.y, home.z),
+            **self._last_reward_terms,
         }
 
     def _near_home_and_slow(self) -> bool:
@@ -429,7 +534,9 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
             f"[PPO RESET READY] episode={self._episode_id}, "
             f"goal_xy_err={info['xy_err']:.2f}, z_err={info['z_err']:.2f}, "
             f"signed_z_err={info['signed_z_err']:.2f}, "
-            f"speed_xy={info['speed_xy']:.2f}, speed_z={info['speed_z']:.2f}"
+            f"speed_xy={info['speed_xy']:.2f}, speed_z={info['speed_z']:.2f}, "
+            f"inside_goal_zone={info['inside_goal_zone']}, "
+            f"dwell={info['goal_dwell_steps']}/{info['required_goal_dwell_steps']}"
         )
 
     def _print_done_state(self, reason: str) -> None:
@@ -452,5 +559,7 @@ class SingleDroneHoverEnv(gym.Env if hasattr(gym, "Env") else object):
             f"goal_rel=({goal_rel_x:.2f},{goal_rel_y:.2f}), "
             f"vx={obs.vx:.2f}, vy={obs.vy:.2f}, vz={obs.vz:.2f}, "
             f"roll={obs.roll:.3f}, pitch={obs.pitch:.3f}, yaw={obs.yaw:.3f}, "
+            f"inside_goal_zone={self._inside_goal_zone}, "
+            f"dwell={self._goal_dwell_steps}/{self._required_goal_dwell_steps}, "
             f"cmd_rate=({cmd[0]:.3f},{cmd[1]:.3f},{cmd[2]:.3f}), cmd_thrust={cmd[3]:.3f}"
         )

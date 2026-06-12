@@ -52,10 +52,13 @@ def parse_args():
     parser.add_argument("--goal_z_tolerance_m", type=float, default=0.35)
     parser.add_argument("--goal_speed_xy_tolerance_mps", type=float, default=0.25)
     parser.add_argument("--goal_speed_z_tolerance_mps", type=float, default=0.25)
+    parser.add_argument("--success_dwell_sec", type=float, default=2.0)
     parser.add_argument("--reward_alive", type=float, default=0.0)
     parser.add_argument("--reward_progress_scale", type=float, default=3.0)
     parser.add_argument("--reward_distance_scale", type=float, default=0.10)
     parser.add_argument("--reward_z_scale", type=float, default=0.20)
+    parser.add_argument("--reward_goal_zone", type=float, default=0.05)
+    parser.add_argument("--reward_dwell_scale", type=float, default=0.05)
     parser.add_argument("--reward_success", type=float, default=8.0)
     parser.add_argument("--reward_timeout", type=float, default=0.0)
     parser.add_argument("--pegasus_log_dir", type=str, default="./log_folder")
@@ -124,6 +127,9 @@ def make_env(args) -> SingleDroneHoverEnv:
         goal_z_tolerance_m=args.goal_z_tolerance_m,
         goal_speed_xy_tolerance_mps=args.goal_speed_xy_tolerance_mps,
         goal_speed_z_tolerance_mps=args.goal_speed_z_tolerance_mps,
+        success_dwell_sec=args.success_dwell_sec,
+        reward_goal_zone=args.reward_goal_zone,
+        reward_dwell_scale=args.reward_dwell_scale,
         action_limits=action_limits,
         safety_limits=safety_limits,
     )
@@ -186,9 +192,12 @@ def main() -> None:
         f"success_speed_tolerance: xy={args.goal_speed_xy_tolerance_mps}, "
         f"z={args.goal_speed_z_tolerance_mps}"
     )
+    print(f"success_dwell_sec: {args.success_dwell_sec}")
     print(
         f"reward: progress={args.reward_progress_scale}, distance={args.reward_distance_scale}, "
-        f"z={args.reward_z_scale}, success={args.reward_success}, timeout={args.reward_timeout}"
+        f"z={args.reward_z_scale}, goal_zone={args.reward_goal_zone}, "
+        f"dwell={args.reward_dwell_scale}, success={args.reward_success}, "
+        f"timeout={args.reward_timeout}"
     )
     print("=" * 80)
 
@@ -201,6 +210,7 @@ def main() -> None:
             xy_errs = []
             z_errs = []
             speed_xys = []
+            dwell_fractions = []
             final_reason = "not_done"
 
             for _ in range(args.episode_length):
@@ -213,6 +223,8 @@ def main() -> None:
                     z_errs.append(float(info["z_err"]))
                 if info.get("speed_xy") is not None:
                     speed_xys.append(float(info["speed_xy"]))
+                if info.get("goal_dwell_fraction") is not None:
+                    dwell_fractions.append(float(info["goal_dwell_fraction"]))
 
                 if done:
                     final_reason = str(info.get("done_reason", "unknown"))
@@ -228,6 +240,7 @@ def main() -> None:
                 "mean_z_err": float(np.mean(z_errs)) if z_errs else 0.0,
                 "max_z_err": float(np.max(z_errs)) if z_errs else 0.0,
                 "max_speed_xy": float(np.max(speed_xys)) if speed_xys else 0.0,
+                "max_goal_dwell_fraction": float(np.max(dwell_fractions)) if dwell_fractions else 0.0,
                 "done_reason": final_reason,
             }
             episode_summaries.append(summary)
@@ -240,6 +253,7 @@ def main() -> None:
                 f"mean_z_err={summary['mean_z_err']:.3f}, "
                 f"max_z_err={summary['max_z_err']:.3f}, "
                 f"max_speed_xy={summary['max_speed_xy']:.3f}, "
+                f"max_dwell={summary['max_goal_dwell_fraction']:.3f}, "
                 f"done_reason={summary['done_reason']}"
             )
 
